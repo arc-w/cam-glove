@@ -1,3 +1,4 @@
+import argparse
 import signal
 import sys
 from PySide6.QtCore import QTimer
@@ -15,7 +16,16 @@ except ImportError:
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="Cam-Glove Hand Tracking Controller")
+    parser.add_argument(
+        "--main-hand",
+        choices=["right", "left", "Right", "Left"],
+        default="Right",
+        help="Default main hand when both hands appear at the same time (default: Right)",
+    )
+    args, qt_args = parser.parse_known_args()
+
+    app = QApplication([sys.argv[0], *qt_args])
     app.setQuitOnLastWindowClosed(True)
 
     screen = QGuiApplication.primaryScreen()
@@ -37,6 +47,7 @@ def main() -> int:
     tracker = HandTrackingWorker(
         screen_width=screen_w,
         screen_height=screen_h,
+        preferred_main_hand=args.main_hand,
     )
 
     # Wire Qt Signals & Slots across threads
@@ -48,6 +59,7 @@ def main() -> int:
     tracker.mouse_up.connect(input_controller.on_mouse_up)
     tracker.click_triggered.connect(overlay.on_click_triggered)
     tracker.click_triggered.connect(input_controller.trigger_click)
+    tracker.secondary_action_triggered.connect(input_controller.trigger_secondary_action)
 
     # Clean shutdown handler
     def shutdown() -> None:
@@ -68,12 +80,14 @@ def main() -> int:
     sigint_timer.timeout.connect(lambda: None)
     sigint_timer.start()
 
-    # Optional global ESC hotkey to exit easily while overlay is click-through
+    # Global hotkeys: ESC to exit, F2 to swap Main Hand (Right <-> Left)
     kb_listener = None
     if pynput_keyboard is not None:
         def on_press(key) -> None:
             if key == pynput_keyboard.Key.esc:
                 QTimer.singleShot(0, shutdown)
+            elif key == pynput_keyboard.Key.f2:
+                tracker.toggle_main_hand()
 
         kb_listener = pynput_keyboard.Listener(on_press=on_press)
         kb_listener.daemon = True
@@ -84,11 +98,16 @@ def main() -> int:
 
     print(
         "Cam-Glove started!\n"
-        "  - Cursor: Index fingertip (landmark 8)\n"
-        "  - Left Click (LMB): Pinch Thumb (4) + Middle (12)\n"
-        "  - Right Click (RMB): Pinch Thumb (4) + Ring (16)\n"
-        "  - Click & Hold (Drag): Pinch Thumb (4) + Pinky (20)\n"
-        "  - Middle Mouse / Wheel Press (MMB): Touch Thumb (4) to Ring Base Knuckle (13)\n"
+        f"  - Main Hand (default: {tracker.preferred_main_hand}, swap with F2 or 'M' in preview):\n"
+        "      * Cursor: Index fingertip (landmark 8)\n"
+        "      * Left Click (LMB): Pinch Thumb (4) + Middle (12)\n"
+        "      * Right Click (RMB): Pinch Thumb (4) + Ring (16)\n"
+        "      * Click & Hold (Drag): Pinch Thumb (4) + Pinky (20)\n"
+        "      * Middle Mouse / Wheel Press (MMB): Touch Thumb (4) to Ring Base Knuckle (13)\n"
+        "  - Additional (2nd) Hand Gestures:\n"
+        "      * 1 Finger (Index): Copy (Ctrl+C)\n"
+        "      * 2 Fingers (Index + Middle): Paste (Ctrl+V)\n"
+        "      * 3 Fingers (Index + Middle + Ring): Show Desktop (Win+D)\n"
         "  - Exit: Press ESC anywhere, 'q' in preview, or Ctrl+C in terminal."
     )
 

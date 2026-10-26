@@ -5,12 +5,15 @@ from typing import Optional
 from PySide6.QtCore import QObject, Slot
 
 try:
+    from pynput.keyboard import Controller as PynputKeyboardController, Key
     from pynput.mouse import Button, Controller as PynputMouseController
 except ImportError:
     PynputMouseController = None  # type: ignore[assignment]
+    PynputKeyboardController = None  # type: ignore[assignment]
     Button = None  # type: ignore[assignment]
+    Key = None  # type: ignore[assignment]
 
-# WinAPI mouse_event flags
+# WinAPI mouse_event & keybd_event flags
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -19,6 +22,13 @@ MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_ABSOLUTE = 0x8000
+
+KEYEVENTF_KEYUP = 0x0002
+VK_CONTROL = 0x11
+VK_LWIN = 0x5B
+VK_C = 0x43
+VK_D = 0x44
+VK_V = 0x56
 
 
 class InputController(QObject):
@@ -39,6 +49,7 @@ class InputController(QObject):
         self.restore_cursor = restore_cursor
         self._is_windows = sys.platform == "win32"
         self._pynput_mouse = PynputMouseController() if PynputMouseController is not None else None
+        self._pynput_kb = PynputKeyboardController() if PynputKeyboardController is not None else None
         self._lmb_held = False
         self._mmb_held = False
 
@@ -146,6 +157,38 @@ class InputController(QObject):
                 ctypes.windll.user32.mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0)
             elif self._pynput_mouse is not None and Button is not None:
                 self._pynput_mouse.release(Button.middle)
+
+    @Slot(str)
+    def trigger_secondary_action(self, action: str) -> None:
+        """Execute keyboard shortcuts for secondary hand gestures ('copy', 'paste', 'show_desktop')."""
+        act = action.lower()
+        if self._is_windows:
+            user32 = ctypes.windll.user32
+            if act == "copy":
+                user32.keybd_event(VK_CONTROL, 0, 0, 0)
+                user32.keybd_event(VK_C, 0, 0, 0)
+                user32.keybd_event(VK_C, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            elif act == "paste":
+                user32.keybd_event(VK_CONTROL, 0, 0, 0)
+                user32.keybd_event(VK_V, 0, 0, 0)
+                user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            elif act == "show_desktop":
+                user32.keybd_event(VK_LWIN, 0, 0, 0)
+                user32.keybd_event(VK_D, 0, 0, 0)
+                user32.keybd_event(VK_D, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+        elif self._pynput_kb is not None and Key is not None:
+            if act == "copy":
+                with self._pynput_kb.pressed(Key.ctrl):
+                    self._pynput_kb.tap("c")
+            elif act == "paste":
+                with self._pynput_kb.pressed(Key.ctrl):
+                    self._pynput_kb.tap("v")
+            elif act == "show_desktop":
+                with self._pynput_kb.pressed(Key.cmd):
+                    self._pynput_kb.tap("d")
 
     @Slot(str, float, float)
     def trigger_click(self, button: str, x: float, y: float) -> None:

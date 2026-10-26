@@ -29,11 +29,16 @@ else:
 MODEL_PATH = _BASE_DIR / "hand_landmarker.task"
 
 # MediaPipe Hand Landmark indices
+WRIST = 0
 THUMB_TIP = 4
+INDEX_PIP = 6
 INDEX_TIP = 8
+MIDDLE_PIP = 10
 MIDDLE_TIP = 12
 RING_MCP = 13
+RING_PIP = 14
 RING_TIP = 16
+PINKY_PIP = 18
 PINKY_TIP = 20
 
 HAND_CONNECTIONS = [
@@ -96,6 +101,48 @@ def _draw_hand(
     cv2.circle(frame, pts[INDEX_TIP], 10, color, cv2.FILLED)
 
 
+def _draw_secondary_hand(
+    frame,
+    hand_lms,
+    w: int,
+    h: int,
+    active_gesture: Optional[str] = None,
+) -> None:
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], (180, 140, 255), 2)
+    for pt in pts:
+        cv2.circle(frame, pt, 4, (200, 80, 255), cv2.FILLED)
+
+    wx, wy = pts[WRIST]
+    label = f"2ND ({active_gesture.upper()})" if active_gesture else "2ND HAND"
+    cv2.putText(
+        frame,
+        label,
+        (max(10, wx - 40), min(h - 10, wy + 25)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 180, 255),
+        2,
+    )
+
+
+def _detect_secondary_gesture(hand_lms) -> Optional[str]:
+    """Classify secondary hand finger count: 1 -> copy, 2 -> paste, 3 -> show_desktop."""
+    idx_up = hand_lms[INDEX_TIP].y < hand_lms[INDEX_PIP].y - 0.015
+    mid_up = hand_lms[MIDDLE_TIP].y < hand_lms[MIDDLE_PIP].y - 0.015
+    ring_up = hand_lms[RING_TIP].y < hand_lms[RING_PIP].y - 0.015
+    pinky_up = hand_lms[PINKY_TIP].y < hand_lms[PINKY_PIP].y - 0.015
+
+    if idx_up and not mid_up and not ring_up and not pinky_up:
+        return "copy"
+    if idx_up and mid_up and not ring_up and not pinky_up:
+        return "paste"
+    if idx_up and mid_up and ring_up and not pinky_up:
+        return "show_desktop"
+    return None
+
+
 class HandTrackingWorker(QThread):
     """Background worker thread for webcam capture, MediaPipe hand tracking, and gesture detection."""
 
@@ -105,6 +152,7 @@ class HandTrackingWorker(QThread):
     mouse_up = Signal(str, float, float)
     pinch_state_changed = Signal(str, bool)
     hand_presence_changed = Signal(bool)
+    secondary_action_triggered = Signal(str)
 
     def __init__(
         self,
@@ -118,6 +166,7 @@ class HandTrackingWorker(QThread):
         margin_x: float = 0.15,
         margin_top: float = 0.10,
         margin_bottom: float = 0.38,
+        preferred_main_hand: str = "Right",
         use_one_euro: bool = True,
         ema_alpha: float = 0.25,
         show_preview: bool = True,
@@ -134,6 +183,9 @@ class HandTrackingWorker(QThread):
         self.margin_x = margin_x
         self.margin_top = margin_top
         self.margin_bottom = margin_bottom
+        self.preferred_main_hand = (
+            "Left" if preferred_main_hand.strip().lower() == "left" else "Right"
+        )
         self.show_preview = show_preview
 
         if use_one_euro:
@@ -149,6 +201,23 @@ class HandTrackingWorker(QThread):
         self._mmb_pinched = False
         self._last_smooth_x = screen_width / 2.0
         self._last_smooth_y = screen_height / 2.0
+
+        # Multi-hand tracking state
+        self._main_wrist_pos: Optional[tuple[float, float]] = None
+        self._swap_requested = False
+        self._sec_candidate_action: Optional[str] = None
+        self._sec_hold_frames = 0
+        self._sec_neutral_frames = 0
+        self._sec_latched_action: Optional[str] = None
+        self._last_sec_banner = ""
+        self._last_sec_banner_time = 0.0
+
+    def toggle_main_hand(self) -> str:
+        """Toggle default main hand preference ('Right' <-> 'Left') and swap active hands if 2 are visible."""
+        self.preferred_main_hand = "Left" if self.preferred_main_hand == "Right" else "Right"
+        self._swap_requested = True
+        print(f"Main hand preference switched to: {self.preferred_main_hand}")
+        return self.preferred_main_hand
 
     def stop(self) -> None:
         """Request the worker loop to terminate cleanly."""
@@ -166,7 +235,7 @@ class HandTrackingWorker(QThread):
         options = vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_buffer=model_path.read_bytes()),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
+            num_hands=2,
             min_hand_detection_confidence=0.7,
             min_hand_presence_confidence=0.7,
             min_tracking_confidence=0.7,
@@ -208,7 +277,48 @@ class HandTrackingWorker(QThread):
                             self._hand_present = True
                             self.hand_presence_changed.emit(True)
 
-                        hand_lms = results.hand_landmarks[0]
+                        hands_list = results.hand_landmarks
+                        secondary_lms = None
+
+                        if len(hands_list) == 1:
+                            # Single hand on camera -> always Main Hand
+                            hand_lms = hands_list[0]
+                            self._main_wrist_pos = (hand_lms[WRIST].x, hand_lms[WRIST].y)
+                            self._swap_requested = False
+                            self._sec_candidate_action = None
+                            self._sec_hold_frames = 0
+                            self._sec_latched_action = None
+                        else:
+                            # Two hands on camera -> determine Main vs Additional hand
+                            h0, h1 = hands_list[0], hands_list[1]
+                            w0 = (h0[WRIST].x, h0[WRIST].y)
+                            w1 = (h1[WRIST].x, h1[WRIST].y)
+
+                            if self._main_wrist_pos is not None:
+                                d0 = math.hypot(w0[0] - self._main_wrist_pos[0], w0[1] - self._main_wrist_pos[1])
+                                d1 = math.hypot(w1[0] - self._main_wrist_pos[0], w1[1] - self._main_wrist_pos[1])
+                                if self._swap_requested:
+                                    # Swap which tracked hand is Main
+                                    main_is_0 = d0 > d1
+                                    self._swap_requested = False
+                                else:
+                                    main_is_0 = d0 <= d1
+                            else:
+                                # Both hands appeared simultaneously -> use preferred_main_hand
+                                # In the horizontally mirrored frame, physical Right hand is on the right (larger x)
+                                if self.preferred_main_hand == "Right":
+                                    main_is_0 = w0[0] >= w1[0]
+                                else:
+                                    main_is_0 = w0[0] < w1[0]
+                                self._swap_requested = False
+
+                            if main_is_0:
+                                hand_lms, secondary_lms = h0, h1
+                            else:
+                                hand_lms, secondary_lms = h1, h0
+
+                            self._main_wrist_pos = (hand_lms[WRIST].x, hand_lms[WRIST].y)
+
                         thumb_tip = hand_lms[THUMB_TIP]
                         index_tip = hand_lms[INDEX_TIP]
                         middle_tip = hand_lms[MIDDLE_TIP]
@@ -283,6 +393,34 @@ class HandTrackingWorker(QThread):
                             self.pinch_state_changed.emit("middle", False)
                             self.mouse_up.emit("middle", smooth_x, smooth_y)
 
+                        # 6. Additional (2nd) Hand Gestures: 1 -> copy, 2 -> paste, 3 -> show_desktop
+                        sec_gesture = None
+                        if secondary_lms is not None:
+                            sec_gesture = _detect_secondary_gesture(secondary_lms)
+                            if sec_gesture is not None:
+                                self._sec_neutral_frames = 0
+                                if sec_gesture == self._sec_candidate_action:
+                                    self._sec_hold_frames += 1
+                                else:
+                                    self._sec_candidate_action = sec_gesture
+                                    self._sec_hold_frames = 1
+
+                                # Require ~8 consecutive frames (~0.25s) to confirm pose without misfiring
+                                if (
+                                    self._sec_hold_frames == 8
+                                    and self._sec_latched_action != sec_gesture
+                                ):
+                                    self._sec_latched_action = sec_gesture
+                                    self.secondary_action_triggered.emit(sec_gesture)
+                                    self._last_sec_banner = f"2ND HAND: {sec_gesture.upper()}"
+                                    self._last_sec_banner_time = now
+                            else:
+                                self._sec_candidate_action = None
+                                self._sec_hold_frames = 0
+                                self._sec_neutral_frames += 1
+                                if self._sec_neutral_frames >= 4:
+                                    self._sec_latched_action = None
+
                         if self.show_preview:
                             _draw_hand(
                                 frame,
@@ -294,7 +432,29 @@ class HandTrackingWorker(QThread):
                                 hold_pinched=self._hold_pinched,
                                 mmb_pinched=self._mmb_pinched,
                             )
+                            mwx, mwy = int(hand_lms[WRIST].x * w), int(hand_lms[WRIST].y * h)
+                            cv2.putText(
+                                frame,
+                                "MAIN",
+                                (max(10, mwx - 25), min(h - 10, mwy + 25)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55,
+                                (100, 255, 180),
+                                2,
+                            )
+                            if secondary_lms is not None:
+                                _draw_secondary_hand(
+                                    frame,
+                                    secondary_lms,
+                                    w,
+                                    h,
+                                    active_gesture=sec_gesture,
+                                )
                     else:
+                        self._main_wrist_pos = None
+                        self._sec_candidate_action = None
+                        self._sec_hold_frames = 0
+                        self._sec_latched_action = None
                         if self._hand_present:
                             self._hand_present = False
                             self.hand_presence_changed.emit(False)
@@ -326,11 +486,34 @@ class HandTrackingWorker(QThread):
                         box_y2 = int((1.0 - self.margin_bottom) * h)
                         cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (100, 220, 255), 1)
 
+                        # HUD info for default/active main hand & recent secondary action
+                        cv2.putText(
+                            frame,
+                            f"Default Main: {self.preferred_main_hand} (Press M or F2 to swap)",
+                            (12, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
+                            (220, 240, 255),
+                            2,
+                        )
+                        if now - self._last_sec_banner_time < 1.2 and self._last_sec_banner:
+                            cv2.putText(
+                                frame,
+                                self._last_sec_banner,
+                                (12, 52),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.65,
+                                (120, 255, 180),
+                                2,
+                            )
+
                         cv2.imshow(window_name, frame)
                         key = cv2.waitKey(1) & 0xFF
                         if key in (27, ord("q")):
                             self._running = False
                             break
+                        elif key in (ord("m"), ord("M")):
+                            self.toggle_main_hand()
         finally:
             cap.release()
             if self.show_preview:
