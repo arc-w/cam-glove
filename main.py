@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication
 
 from actions.input_controller import InputController
 from core.tracker import HandTrackingWorker
+from gui.main_window import MainWindow
 from gui.overlay import CursorOverlay
 
 try:
@@ -48,6 +49,7 @@ def main() -> int:
         screen_width=screen_w,
         screen_height=screen_h,
         preferred_main_hand=args.main_hand,
+        show_cv_window=False,
     )
 
     # Wire Qt Signals & Slots across threads
@@ -61,13 +63,21 @@ def main() -> int:
     tracker.click_triggered.connect(input_controller.trigger_click)
     tracker.secondary_action_triggered.connect(input_controller.trigger_secondary_action)
 
-    # Clean shutdown handler
+    shutting_down = False
+
     def shutdown() -> None:
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
         input_controller.release_all()
         if tracker.isRunning():
             tracker.stop()
         overlay.close()
+        main_window.close()
         app.quit()
+
+    main_window = MainWindow(tracker=tracker, on_close_callback=shutdown)
 
     tracker.finished.connect(shutdown)
     app.aboutToQuit.connect(input_controller.release_all)
@@ -87,29 +97,15 @@ def main() -> int:
             if key == pynput_keyboard.Key.esc:
                 QTimer.singleShot(0, shutdown)
             elif key == pynput_keyboard.Key.f2:
-                tracker.toggle_main_hand()
+                tracker.swap_active_main_hand()
 
         kb_listener = pynput_keyboard.Listener(on_press=on_press)
         kb_listener.daemon = True
         kb_listener.start()
 
     overlay.show()
+    main_window.show()
     tracker.start()
-
-    print(
-        "Cam-Glove started!\n"
-        f"  - Main Hand (default: {tracker.preferred_main_hand}, swap with F2 or 'M' in preview):\n"
-        "      * Cursor: Index fingertip (landmark 8)\n"
-        "      * Left Click (LMB): Pinch Thumb (4) + Middle (12)\n"
-        "      * Right Click (RMB): Pinch Thumb (4) + Ring (16)\n"
-        "      * Click & Hold (Drag): Pinch Thumb (4) + Pinky (20)\n"
-        "      * Middle Mouse / Wheel Press (MMB): Touch Thumb (4) to Ring Base Knuckle (13)\n"
-        "  - Additional (2nd) Hand Gestures:\n"
-        "      * 1 Finger (Index): Copy (Ctrl+C)\n"
-        "      * 2 Fingers (Index + Middle): Paste (Ctrl+V)\n"
-        "      * 3 Fingers (Index + Middle + Ring): Show Desktop (Win+D)\n"
-        "  - Exit: Press ESC anywhere, 'q' in preview, or Ctrl+C in terminal."
-    )
 
     exit_code = app.exec()
     if kb_listener is not None:
