@@ -1,5 +1,7 @@
 import ctypes
 import ctypes.wintypes
+import os
+import subprocess
 import sys
 from typing import Optional
 from PySide6.QtCore import QObject, Slot
@@ -28,6 +30,7 @@ VK_CONTROL = 0x11
 VK_LWIN = 0x5B
 VK_C = 0x43
 VK_D = 0x44
+VK_O = 0x4F
 VK_V = 0x56
 
 
@@ -160,8 +163,18 @@ class InputController(QObject):
 
     @Slot(str)
     def trigger_secondary_action(self, action: str) -> None:
-        """Execute keyboard shortcuts for secondary hand gestures ('copy', 'paste', 'show_desktop')."""
+        """Execute secondary hand actions ('copy', 'paste', 'show_desktop', 'open_osk', or 'exec:<path>')."""
+        if action.startswith("exec:"):
+            target_path = action[5:].strip()
+            if target_path:
+                self._launch_target(target_path)
+            return
+
         act = action.lower()
+        if act == "open_osk":
+            self._open_virtual_keyboard()
+            return
+
         if self._is_windows:
             user32 = ctypes.windll.user32
             if act == "copy":
@@ -189,6 +202,31 @@ class InputController(QObject):
             elif act == "show_desktop":
                 with self._pynput_kb.pressed(Key.cmd):
                     self._pynput_kb.tap("d")
+
+    def _open_virtual_keyboard(self) -> None:
+        """Toggle Windows On-Screen Keyboard via native Win+Ctrl+O shortcut (avoids UAC/Wow64 issues)."""
+        if self._is_windows:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(VK_LWIN, 0, 0, 0)
+            user32.keybd_event(VK_CONTROL, 0, 0, 0)
+            user32.keybd_event(VK_O, 0, 0, 0)
+            user32.keybd_event(VK_O, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+        elif self._pynput_kb is not None and Key is not None:
+            with self._pynput_kb.pressed(Key.cmd):
+                with self._pynput_kb.pressed(Key.ctrl):
+                    self._pynput_kb.tap("o")
+
+    def _launch_target(self, target_path: str) -> None:
+        """Launch a user-specified executable, Start Menu shortcut (.lnk), or file."""
+        try:
+            if self._is_windows and hasattr(os, "startfile"):
+                os.startfile(target_path)
+            else:
+                subprocess.Popen([target_path], close_fds=True)
+        except Exception as exc:
+            print(f"Error launching '{target_path}': {exc}")
 
     @Slot(str, float, float)
     def trigger_click(self, button: str, x: float, y: float) -> None:

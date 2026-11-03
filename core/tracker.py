@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import urllib.request
 
 # Suppress verbose MediaPipe / TensorFlow Lite C++ logs
@@ -31,6 +31,7 @@ MODEL_PATH = _BASE_DIR / "hand_landmarker.task"
 
 # MediaPipe Hand Landmark indices
 WRIST = 0
+THUMB_MCP = 2
 THUMB_TIP = 4
 INDEX_PIP = 6
 INDEX_TIP = 8
@@ -39,6 +40,7 @@ MIDDLE_TIP = 12
 RING_MCP = 13
 RING_PIP = 14
 RING_TIP = 16
+PINKY_MCP = 17
 PINKY_PIP = 18
 PINKY_TIP = 20
 
@@ -82,6 +84,15 @@ def _norm_dist(lm1, lm2) -> float:
     return math.hypot(lm1.x - lm2.x, lm1.y - lm2.y)
 
 
+def _format_action_banner(action: str) -> str:
+    if action.startswith("exec:"):
+        p = Path(action[5:].strip())
+        return f"RUN: {p.stem or p.name}"
+    if action == "open_osk":
+        return "VIRTUAL KEYBOARD"
+    return action.upper()
+
+
 def _draw_hand(
     frame,
     hand_lms,
@@ -121,6 +132,7 @@ def _draw_secondary_hand(
     w: int,
     h: int,
     active_label: Optional[str] = None,
+    active_pinch_pair: Optional[Tuple[int, int]] = None,
 ) -> None:
     pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms]
     for a, b in HAND_CONNECTIONS:
@@ -128,8 +140,14 @@ def _draw_secondary_hand(
     for pt in pts:
         cv2.circle(frame, pt, 4, (200, 80, 255), cv2.FILLED)
 
+    if active_pinch_pair is not None:
+        pa, pb = active_pinch_pair
+        cv2.line(frame, pts[pa], pts[pb], (0, 255, 180), 3)
+        cv2.circle(frame, pts[pa], 7, (0, 255, 180), cv2.FILLED)
+        cv2.circle(frame, pts[pb], 7, (0, 255, 180), cv2.FILLED)
+
     wx, wy = pts[WRIST]
-    label = f"2ND ({active_label.upper()})" if active_label else "2ND HAND"
+    label = f"2ND ({active_label})" if active_label else "2ND HAND"
     cv2.putText(
         frame,
         label,
@@ -141,20 +159,76 @@ def _draw_secondary_hand(
     )
 
 
-def _detect_secondary_gesture(hand_lms) -> Optional[str]:
-    """Classify secondary hand finger count: one_finger, two_fingers, or three_fingers."""
+def _get_finger_states(hand_lms) -> Dict[str, bool]:
+    """Return extended (True) vs curled (False) state for all 5 fingers."""
     idx_up = hand_lms[INDEX_TIP].y < hand_lms[INDEX_PIP].y - 0.015
     mid_up = hand_lms[MIDDLE_TIP].y < hand_lms[MIDDLE_PIP].y - 0.015
     ring_up = hand_lms[RING_TIP].y < hand_lms[RING_PIP].y - 0.015
     pinky_up = hand_lms[PINKY_TIP].y < hand_lms[PINKY_PIP].y - 0.015
+    thumb_up = (
+        _norm_dist(hand_lms[THUMB_TIP], hand_lms[PINKY_MCP])
+        > _norm_dist(hand_lms[THUMB_MCP], hand_lms[PINKY_MCP]) * 1.22
+    )
+    return {
+        "thumb": thumb_up,
+        "index": idx_up,
+        "middle": mid_up,
+        "ring": ring_up,
+        "pinky": pinky_up,
+    }
+
+
+def _detect_secondary_gesture(
+    hand_lms,
+    custom_gestures: List[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
+    """Evaluate custom 2-point pinches, custom finger poses, and built-in poses on the 2nd hand."""
+    # 1. Check custom 2-point pinch gestures first
+    for cg in custom_gestures:
+        if cg.get("type") == "pinch":
+            pa = int(cg.get("point_a", 4))
+            pb = int(cg.get("point_b", 8))
+            thresh = float(cg.get("threshold", 0.048))
+            if 0 <= pa <= 20 and 0 <= pb <= 20:
+                if _norm_dist(hand_lms[pa], hand_lms[pb]) < thresh:
+                    return str(cg["id"]), (pa, pb)
+
+    f_states = _get_finger_states(hand_lms)
+
+    # 2. Check custom finger poses ("Show Fingers")
+    for cg in custom_gestures:
+        if cg.get("type") == "pose":
+            target = cg.get("fingers", {})
+            if (
+                f_states["index"] == bool(target.get("index", False))
+                and f_states["middle"] == bool(target.get("middle", False))
+                and f_states["ring"] == bool(target.get("ring", False))
+                and f_states["pinky"] == bool(target.get("pinky", False))
+            ):
+                want_thumb = bool(target.get("thumb", False))
+                any_other_up = any(
+                    bool(target.get(k, False)) for k in ("index", "middle", "ring", "pinky")
+                )
+                # Require thumb match if thumb was explicitly toggled UP or if pose is Fist/Thumb-only
+                if want_thumb and not f_states["thumb"]:
+                    continue
+                if not any_other_up and f_states["thumb"] != want_thumb:
+                    continue
+                return str(cg["id"]), None
+
+    # 3. Built-in 1, 2, 3 finger poses
+    idx_up = f_states["index"]
+    mid_up = f_states["middle"]
+    ring_up = f_states["ring"]
+    pinky_up = f_states["pinky"]
 
     if idx_up and not mid_up and not ring_up and not pinky_up:
-        return "one_finger"
+        return "one_finger", None
     if idx_up and mid_up and not ring_up and not pinky_up:
-        return "two_fingers"
+        return "two_fingers", None
     if idx_up and mid_up and ring_up and not pinky_up:
-        return "three_fingers"
-    return None
+        return "three_fingers", None
+    return None, None
 
 
 class HandTrackingWorker(QThread):
@@ -206,6 +280,7 @@ class HandTrackingWorker(QThread):
 
         self.main_bindings: Dict[str, str] = dict(DEFAULT_MAIN_BINDINGS)
         self.secondary_bindings: Dict[str, str] = dict(DEFAULT_SECONDARY_BINDINGS)
+        self.custom_gestures: List[Dict[str, Any]] = []
 
         if use_one_euro:
             self.smoother = OneEuroFilter2D(min_cutoff=1.2, beta=0.015, d_cutoff=1.0)
@@ -257,9 +332,24 @@ class HandTrackingWorker(QThread):
     def set_secondary_binding(self, gesture_key: str, action_key: str) -> None:
         self.secondary_bindings[gesture_key] = action_key
 
+    def add_custom_gesture(self, gesture: Dict[str, Any], action_key: str = "none") -> None:
+        gid = str(gesture["id"])
+        self.custom_gestures = [g for g in self.custom_gestures if g.get("id") != gid]
+        self.custom_gestures.append(gesture)
+        self.secondary_bindings[gid] = action_key
+
+    def remove_custom_gesture(self, gesture_id: str) -> None:
+        self.custom_gestures = [g for g in self.custom_gestures if g.get("id") != gesture_id]
+        self.secondary_bindings.pop(gesture_id, None)
+
     def reset_default_bindings(self) -> None:
         self.main_bindings = dict(DEFAULT_MAIN_BINDINGS)
-        self.secondary_bindings = dict(DEFAULT_SECONDARY_BINDINGS)
+        for k, v in DEFAULT_SECONDARY_BINDINGS.items():
+            self.secondary_bindings[k] = v
+        for cg in self.custom_gestures:
+            gid = str(cg.get("id", ""))
+            if gid and gid not in self.secondary_bindings:
+                self.secondary_bindings[gid] = "none"
 
     def _activate_action(self, action: str, x: float, y: float) -> None:
         if action == "left_click":
@@ -274,7 +364,7 @@ class HandTrackingWorker(QThread):
         elif action == "hold_mmb":
             self.pinch_state_changed.emit("middle", True)
             self.mouse_down.emit("middle", x, y)
-        elif action in ("copy", "paste", "show_desktop"):
+        elif action in ("copy", "paste", "show_desktop", "open_osk") or action.startswith("exec:"):
             self.secondary_action_triggered.emit(action)
 
     def _deactivate_action(self, action: str, x: float, y: float) -> None:
@@ -479,14 +569,20 @@ class HandTrackingWorker(QThread):
                             blocked=fingertip_pinch_busy,
                         )
 
-                        # Additional (2nd) Hand Gestures
+                        # Additional (2nd) Hand Gestures (Custom + Built-in)
                         sec_action_display = None
+                        sec_pinch_pair = None
                         if secondary_lms is not None:
-                            sec_gesture = _detect_secondary_gesture(secondary_lms)
+                            sec_gesture, sec_pinch_pair = _detect_secondary_gesture(
+                                secondary_lms,
+                                self.custom_gestures,
+                            )
                             if sec_gesture is not None:
                                 mapped_action = self.secondary_bindings.get(sec_gesture, "none")
                                 sec_action_display = (
-                                    mapped_action if mapped_action != "none" else sec_gesture
+                                    _format_action_banner(mapped_action)
+                                    if mapped_action != "none"
+                                    else sec_gesture
                                 )
                                 self._sec_neutral_frames = 0
                                 if sec_gesture == self._sec_candidate_gesture:
@@ -503,7 +599,9 @@ class HandTrackingWorker(QThread):
                                     if mapped_action != "none":
                                         self._activate_action(mapped_action, smooth_x, smooth_y)
                                         self._deactivate_action(mapped_action, smooth_x, smooth_y)
-                                        self._last_sec_banner = f"2ND HAND: {mapped_action.upper()}"
+                                        self._last_sec_banner = (
+                                            f"2ND HAND: {_format_action_banner(mapped_action)}"
+                                        )
                                         self._last_sec_banner_time = now
                             else:
                                 self._sec_candidate_gesture = None
@@ -541,6 +639,7 @@ class HandTrackingWorker(QThread):
                                 w,
                                 h,
                                 active_label=sec_action_display,
+                                active_pinch_pair=sec_pinch_pair,
                             )
                     else:
                         self._main_wrist_pos = None
