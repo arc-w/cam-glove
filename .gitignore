@@ -1,2 +1,10 @@
-dist/
+__pycache__/
+*.py[cod]
+*$py.class
 build/
+dist/
+.venv/
+venv/
+env/
+.agents/rules/project-context.md
+AGENTS.md
