@@ -6,5 +6,6 @@ dist/
 .venv/
 venv/
 env/
+cam_glove_settings.json
 .agents/rules/project-context.md
 AGENTS.md
