@@ -35,9 +35,12 @@ MODEL_PATH = _BASE_DIR / "hand_landmarker.task"
 # MediaPipe Hand Landmark indices
 WRIST = 0
 THUMB_MCP = 2
+THUMB_IP = 3
 THUMB_TIP = 4
+INDEX_MCP = 5
 INDEX_PIP = 6
 INDEX_TIP = 8
+MIDDLE_MCP = 9
 MIDDLE_PIP = 10
 MIDDLE_TIP = 12
 RING_MCP = 13
@@ -46,6 +49,8 @@ RING_TIP = 16
 PINKY_MCP = 17
 PINKY_PIP = 18
 PINKY_TIP = 20
+
+REF_PALM_SCALE = 0.145
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -75,6 +80,8 @@ DEFAULT_ROI_MARGINS: Dict[str, float] = {
     "bottom": 0.38,
 }
 
+SECONDARY_HOLD_FRAMES = 7
+
 
 def ensure_model(model_path: Path = MODEL_PATH) -> Path:
     if not model_path.exists():
@@ -92,6 +99,21 @@ def _clamp(val: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 def _norm_dist(lm1, lm2) -> float:
     return math.hypot(lm1.x - lm2.x, lm1.y - lm2.y)
+
+
+def _compute_hand_scale_factor(hand_lms) -> float:
+    """
+    Compute a depth-invariant scale multiplier relative to REF_PALM_SCALE (0.145)
+    using rigid palm bone lengths (Wrist to Index/Middle/Ring/Pinky MCP knuckles).
+    """
+    w = hand_lms[WRIST]
+    d_idx = _norm_dist(w, hand_lms[INDEX_MCP])
+    d_mid = _norm_dist(w, hand_lms[MIDDLE_MCP])
+    d_ring = _norm_dist(w, hand_lms[RING_MCP])
+    d_pinky = _norm_dist(w, hand_lms[PINKY_MCP])
+    palm_span = _norm_dist(hand_lms[INDEX_MCP], hand_lms[PINKY_MCP])
+    palm_size = max(d_idx, d_mid, d_ring, d_pinky, palm_span * 1.35)
+    return _clamp(palm_size / REF_PALM_SCALE, 0.55, 1.85)
 
 
 def _are_same_physical_hand(h0, h1) -> bool:
@@ -145,7 +167,6 @@ def _are_same_physical_hand(h0, h1) -> bool:
 
 def _select_better_single_hand(h0, h1, handedness_list=None):
     """When h0 and h1 are duplicates on one physical hand, pick the better-formed skeleton."""
-    # A duplicate ghost hand on the same physical hand collapses the thumb onto the pinky side.
     spread0 = _norm_dist(h0[THUMB_TIP], h0[PINKY_MCP])
     spread1 = _norm_dist(h1[THUMB_TIP], h1[PINKY_MCP])
     if spread1 > spread0 * 1.15:
@@ -163,13 +184,36 @@ def _select_better_single_hand(h0, h1, handedness_list=None):
     return h0
 
 
+ACTION_DISPLAY_NAMES: Dict[str, str] = {
+    "left_click": "LEFT CLICK",
+    "double_click": "DOUBLE CLICK",
+    "right_click": "RIGHT CLICK",
+    "hold_lmb": "HOLD LMB",
+    "hold_mmb": "SCROLL / MMB",
+    "copy": "COPY (CTRL+C)",
+    "paste": "PASTE (CTRL+V)",
+    "undo": "UNDO (CTRL+Z)",
+    "select_all": "SELECT ALL",
+    "show_desktop": "SHOW DESKTOP",
+    "task_view": "TASK VIEW",
+    "screenshot": "SCREENSHOT",
+    "open_osk": "VIRTUAL KEYBOARD",
+    "scroll_up": "SCROLL UP",
+    "scroll_down": "SCROLL DOWN",
+    "media_play_pause": "PLAY / PAUSE",
+    "media_next": "NEXT TRACK",
+    "media_prev": "PREV TRACK",
+    "vol_up": "VOLUME UP",
+    "vol_down": "VOLUME DOWN",
+    "vol_mute": "MUTE AUDIO",
+}
+
+
 def _format_action_banner(action: str) -> str:
     if action.startswith("exec:"):
         p = Path(action[5:].strip())
         return f"RUN: {p.stem or p.name}"
-    if action == "open_osk":
-        return "VIRTUAL KEYBOARD"
-    return action.upper()
+    return ACTION_DISPLAY_NAMES.get(action, action.upper())
 
 
 def _draw_hand(
@@ -181,6 +225,7 @@ def _draw_hand(
     rmb_pinched: bool = False,
     hold_pinched: bool = False,
     mmb_pinched: bool = False,
+    stabilized: bool = False,
 ) -> None:
     pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms]
     for a, b in HAND_CONNECTIONS:
@@ -203,6 +248,8 @@ def _draw_hand(
     else:
         color = (255, 210, 0)
     cv2.circle(frame, pts[INDEX_TIP], 10, color, cv2.FILLED)
+    if stabilized:
+        cv2.circle(frame, pts[INDEX_TIP], 14, (120, 255, 220), 1)
 
 
 def _draw_secondary_hand(
@@ -212,6 +259,7 @@ def _draw_secondary_hand(
     h: int,
     active_label: Optional[str] = None,
     active_pinch_pair: Optional[Tuple[int, int]] = None,
+    hold_progress: float = 0.0,
 ) -> None:
     pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms]
     for a, b in HAND_CONNECTIONS:
@@ -226,11 +274,26 @@ def _draw_secondary_hand(
         cv2.circle(frame, pts[pb], 7, (0, 255, 180), cv2.FILLED)
 
     wx, wy = pts[WRIST]
+    if 0.05 < hold_progress < 1.0:
+        end_angle = int(360 * _clamp(hold_progress, 0.0, 1.0))
+        cv2.ellipse(
+            frame,
+            (wx, wy),
+            (18, 18),
+            -90,
+            0,
+            end_angle,
+            (0, 255, 180),
+            3,
+        )
+    elif hold_progress >= 1.0:
+        cv2.circle(frame, (wx, wy), 18, (0, 255, 140), 2)
+
     label = f"2ND ({active_label})" if active_label else "2ND HAND"
     cv2.putText(
         frame,
         label,
-        (max(10, wx - 40), min(h - 10, wy + 25)),
+        (max(10, wx - 40), min(h - 10, wy + 28)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
         (255, 180, 255),
@@ -238,15 +301,38 @@ def _draw_secondary_hand(
     )
 
 
+def _is_finger_extended(hand_lms, mcp_idx: int, pip_idx: int, tip_idx: int) -> bool:
+    """
+    Orientation-resilient finger extension check combining radial wrist distance
+    and bone uncurling ratio so tilted hands are still recognized accurately.
+    """
+    wrist = hand_lms[WRIST]
+    mcp = hand_lms[mcp_idx]
+    pip = hand_lms[pip_idx]
+    tip = hand_lms[tip_idx]
+
+    d_wrist_tip = _norm_dist(wrist, tip)
+    d_wrist_pip = _norm_dist(wrist, pip)
+    d_mcp_tip = _norm_dist(mcp, tip)
+    d_mcp_pip = max(1e-5, _norm_dist(mcp, pip))
+
+    radial_extended = d_wrist_tip > d_wrist_pip * 1.12 and (d_mcp_tip / d_mcp_pip) > 1.32
+    vertical_extended = tip.y < pip.y - 0.012 and d_wrist_tip > d_wrist_pip * 1.03
+    return radial_extended or vertical_extended
+
+
 def _get_finger_states(hand_lms) -> Dict[str, bool]:
     """Return extended (True) vs curled (False) state for all 5 fingers."""
-    idx_up = hand_lms[INDEX_TIP].y < hand_lms[INDEX_PIP].y - 0.015
-    mid_up = hand_lms[MIDDLE_TIP].y < hand_lms[MIDDLE_PIP].y - 0.015
-    ring_up = hand_lms[RING_TIP].y < hand_lms[RING_PIP].y - 0.015
-    pinky_up = hand_lms[PINKY_TIP].y < hand_lms[PINKY_PIP].y - 0.015
+    idx_up = _is_finger_extended(hand_lms, INDEX_MCP, INDEX_PIP, INDEX_TIP)
+    mid_up = _is_finger_extended(hand_lms, MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP)
+    ring_up = _is_finger_extended(hand_lms, RING_MCP, RING_PIP, RING_TIP)
+    pinky_up = _is_finger_extended(hand_lms, PINKY_MCP, PINKY_PIP, PINKY_TIP)
+
     thumb_up = (
         _norm_dist(hand_lms[THUMB_TIP], hand_lms[PINKY_MCP])
-        > _norm_dist(hand_lms[THUMB_MCP], hand_lms[PINKY_MCP]) * 1.22
+        > _norm_dist(hand_lms[THUMB_MCP], hand_lms[PINKY_MCP]) * 1.20
+        and _norm_dist(hand_lms[THUMB_TIP], hand_lms[INDEX_MCP])
+        > _norm_dist(hand_lms[THUMB_IP], hand_lms[INDEX_MCP]) * 1.05
     )
     return {
         "thumb": thumb_up,
@@ -260,14 +346,17 @@ def _get_finger_states(hand_lms) -> Dict[str, bool]:
 def _detect_secondary_gesture(
     hand_lms,
     custom_gestures: List[Dict[str, Any]],
+    hand_scale: float = 1.0,
+    sensitivity_mult: float = 1.0,
 ) -> Tuple[Optional[str], Optional[Tuple[int, int]]]:
     """Evaluate custom 2-point pinches, custom finger poses, and built-in poses on the 2nd hand."""
-    # 1. Check custom 2-point pinch gestures first
+    # 1. Check custom 2-point pinch gestures first (depth-scaled)
     for cg in custom_gestures:
         if cg.get("type") == "pinch":
             pa = int(cg.get("point_a", 4))
             pb = int(cg.get("point_b", 8))
-            thresh = float(cg.get("threshold", 0.048))
+            base_thresh = float(cg.get("threshold", 0.048))
+            thresh = base_thresh * hand_scale * sensitivity_mult
             if 0 <= pa <= 20 and 0 <= pb <= 20:
                 if _norm_dist(hand_lms[pa], hand_lms[pb]) < thresh:
                     return str(cg["id"]), (pa, pb)
@@ -288,7 +377,6 @@ def _detect_secondary_gesture(
                 any_other_up = any(
                     bool(target.get(k, False)) for k in ("index", "middle", "ring", "pinky")
                 )
-                # Require thumb match if thumb was explicitly toggled UP or if pose is Fist/Thumb-only
                 if want_thumb and not f_states["thumb"]:
                     continue
                 if not any_other_up and f_states["thumb"] != want_thumb:
@@ -322,6 +410,8 @@ class HandTrackingWorker(QThread):
     secondary_action_triggered = Signal(str)
     frame_ready = Signal(QImage)
     main_hand_changed = Signal(str)
+    tracking_paused_changed = Signal(bool)
+    fps_updated = Signal(float)
 
     def __init__(
         self,
@@ -359,6 +449,13 @@ class HandTrackingWorker(QThread):
         )
         self.show_cv_window = show_cv_window
 
+        # User-tunable smoothing (1..100, default 50) & pinch sensitivity (50..150%, default 100)
+        self.smoothing_level: int = 50
+        self.pinch_sensitivity: int = 100
+        self.pinch_stabilization: bool = True
+        self.preview_enabled: bool = True
+        self.paused: bool = False
+
         self.main_bindings: Dict[str, str] = dict(DEFAULT_MAIN_BINDINGS)
         self.secondary_bindings: Dict[str, str] = dict(DEFAULT_SECONDARY_BINDINGS)
         self.custom_gestures: List[Dict[str, Any]] = []
@@ -369,6 +466,7 @@ class HandTrackingWorker(QThread):
             self.smoother = EMAFilter2D(alpha=ema_alpha)
 
         self._running = False
+        self._reopen_camera = False
         self._hand_present = False
         self._gesture_pinched: Dict[str, bool] = {
             "thumb_middle": False,
@@ -379,6 +477,7 @@ class HandTrackingWorker(QThread):
         self._gesture_active_action: Dict[str, str] = {}
         self._last_smooth_x = screen_width / 2.0
         self._last_smooth_y = screen_height / 2.0
+        self._last_click_anchor_time = 0.0
 
         # Multi-hand tracking state
         self._main_wrist_pos: Optional[tuple[float, float]] = None
@@ -389,6 +488,42 @@ class HandTrackingWorker(QThread):
         self._sec_latched_gesture: Optional[str] = None
         self._last_sec_banner = ""
         self._last_sec_banner_time = 0.0
+
+    def set_paused(self, paused: bool) -> None:
+        if self.paused != paused:
+            self.paused = paused
+            if paused:
+                self._release_all_gestures()
+                if self._hand_present:
+                    self._hand_present = False
+                    self.hand_presence_changed.emit(False)
+            self.tracking_paused_changed.emit(self.paused)
+
+    def toggle_paused(self) -> bool:
+        self.set_paused(not self.paused)
+        return self.paused
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        self.preview_enabled = bool(enabled)
+
+    def set_camera_index(self, index: int) -> None:
+        idx = max(0, int(index))
+        if idx != self.camera_index:
+            self.camera_index = idx
+            self._reopen_camera = True
+
+    def set_smoothing_level(self, level: int) -> None:
+        """Map slider 1..100 (1 = ultra responsive, 50 = balanced, 100 = ultra smooth) to OneEuroFilter."""
+        self.smoothing_level = int(_clamp(float(level), 1.0, 100.0))
+        norm = (self.smoothing_level - 1) / 99.0  # 0.0 (fast) -> 1.0 (smooth)
+        min_cutoff = 2.6 * ((0.30 / 2.6) ** norm)
+        beta = 0.035 * ((0.004 / 0.035) ** norm)
+        if isinstance(self.smoother, OneEuroFilter2D):
+            self.smoother.set_params(min_cutoff=min_cutoff, beta=beta, d_cutoff=1.0)
+
+    def set_pinch_sensitivity(self, pct: int) -> None:
+        """Set pinch threshold multiplier percentage (60% = tighter pinch, 140% = easier pinch)."""
+        self.pinch_sensitivity = int(_clamp(float(pct), 60.0, 140.0))
 
     def set_preferred_main_hand(self, hand: str) -> None:
         new_hand = "Left" if hand.strip().lower() == "left" else "Right"
@@ -462,25 +597,34 @@ class HandTrackingWorker(QThread):
             if gid and gid not in self.secondary_bindings:
                 self.secondary_bindings[gid] = "none"
         self.reset_mapping_margins()
+        self.set_smoothing_level(50)
+        self.set_pinch_sensitivity(100)
 
     def _activate_action(self, action: str, x: float, y: float) -> None:
         if action == "left_click":
+            self._last_click_anchor_time = time.monotonic()
             self.pinch_state_changed.emit("left", True)
             self.click_triggered.emit("left", x, y)
+        elif action == "double_click":
+            self._last_click_anchor_time = time.monotonic()
+            self.pinch_state_changed.emit("left", True)
+            self.click_triggered.emit("double", x, y)
         elif action == "right_click":
+            self._last_click_anchor_time = time.monotonic()
             self.pinch_state_changed.emit("right", True)
             self.click_triggered.emit("right", x, y)
         elif action == "hold_lmb":
+            self._last_click_anchor_time = time.monotonic()
             self.pinch_state_changed.emit("hold", True)
             self.mouse_down.emit("left", x, y)
         elif action == "hold_mmb":
             self.pinch_state_changed.emit("middle", True)
             self.mouse_down.emit("middle", x, y)
-        elif action in ("copy", "paste", "show_desktop", "open_osk") or action.startswith("exec:"):
+        elif action != "none":
             self.secondary_action_triggered.emit(action)
 
     def _deactivate_action(self, action: str, x: float, y: float) -> None:
-        if action == "left_click":
+        if action in ("left_click", "double_click"):
             self.pinch_state_changed.emit("left", False)
         elif action == "right_click":
             self.pinch_state_changed.emit("right", False)
@@ -545,11 +689,24 @@ class HandTrackingWorker(QThread):
         last_ts_ms = 0
         failed_reads = 0
         lost_hand_frames = 0
+        fps_frame_count = 0
+        fps_last_time = time.monotonic()
+        current_fps = 0.0
         window_name = "Cam-Glove Preview"
 
         try:
             with vision.HandLandmarker.create_from_options(options) as landmarker:
                 while self._running:
+                    if self._reopen_camera:
+                        self._reopen_camera = False
+                        cap.release()
+                        new_cap = cv2.VideoCapture(self.camera_index)
+                        if new_cap.isOpened():
+                            cap = new_cap
+                        else:
+                            cap = cv2.VideoCapture(0)
+                            self.camera_index = 0
+
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         failed_reads += 1
@@ -560,13 +717,47 @@ class HandTrackingWorker(QThread):
                         continue
                     failed_reads = 0
 
+                    now = time.monotonic()
+                    fps_frame_count += 1
+                    if now - fps_last_time >= 0.5:
+                        current_fps = fps_frame_count / (now - fps_last_time)
+                        fps_frame_count = 0
+                        fps_last_time = now
+                        self.fps_updated.emit(current_fps)
+
                     # Flip horizontally for natural mirror movement
                     frame = cv2.flip(frame, 1)
                     h, w, _ = frame.shape
+
+                    if self.paused:
+                        if self.preview_enabled or self.show_cv_window:
+                            overlay_dark = frame.copy()
+                            cv2.rectangle(overlay_dark, (0, 0), (w, h), (15, 18, 24), cv2.FILLED)
+                            cv2.addWeighted(overlay_dark, 0.55, frame, 0.45, 0, frame)
+                            cv2.putText(
+                                frame,
+                                "TRACKING PAUSED (Press F4 to Resume)",
+                                (max(16, w // 2 - 205), h // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.68,
+                                (80, 210, 255),
+                                2,
+                            )
+                            rgb_preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            q_img = QImage(
+                                rgb_preview.data,
+                                w,
+                                h,
+                                3 * w,
+                                QImage.Format.Format_RGB888,
+                            ).copy()
+                            self.frame_ready.emit(q_img)
+                        time.sleep(0.03)
+                        continue
+
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-                    now = time.monotonic()
                     ts_ms = max(last_ts_ms + 1, int(now * 1000))
                     last_ts_ms = ts_ms
 
@@ -631,6 +822,40 @@ class HandTrackingWorker(QThread):
                         ring_tip = hand_lms[RING_TIP]
                         pinky_tip = hand_lms[PINKY_TIP]
 
+                        # Depth-invariant hand scale + user sensitivity multiplier
+                        hand_scale = _compute_hand_scale_factor(hand_lms)
+                        sens_mult = self.pinch_sensitivity / 100.0
+                        eff_pinch = self.pinch_threshold * hand_scale * sens_mult
+                        eff_release = self.release_threshold * hand_scale * sens_mult
+                        eff_mmb_pinch = self.mmb_pinch_threshold * hand_scale * sens_mult
+                        eff_mmb_release = self.mmb_release_threshold * hand_scale * sens_mult
+
+                        # Compute distances for Main Hand gestures
+                        d_mid = _norm_dist(thumb_tip, middle_tip)
+                        d_ring = _norm_dist(thumb_tip, ring_tip)
+                        d_pinky = _norm_dist(thumb_tip, pinky_tip)
+                        d_ring_mcp = _norm_dist(thumb_tip, ring_mcp)
+
+                        # Pre-Pinch Cursor Stabilization ("Pinch Anchor"):
+                        # Dampen involuntary index fingertip pull when middle/ring/pinky close toward thumb
+                        damping_scale = 1.0
+                        is_stabilized = False
+                        if self.pinch_stabilization:
+                            active_vals_now = set(self._gesture_active_action.values())
+                            is_dragging = "hold_lmb" in active_vals_now or "hold_mmb" in active_vals_now
+                            min_click_dist = min(d_mid, d_ring)
+                            if now - self._last_click_anchor_time < 0.11 and not is_dragging:
+                                damping_scale = 0.08
+                                is_stabilized = True
+                            elif min_click_dist < eff_pinch * 1.60 and not is_dragging:
+                                ratio = _clamp(
+                                    (min_click_dist - eff_pinch * 0.85) / (eff_pinch * 0.75),
+                                    0.0,
+                                    1.0,
+                                )
+                                damping_scale = 0.12 + 0.88 * ratio
+                                is_stabilized = damping_scale < 0.65
+
                         # 1. Index fingertip (landmark 8) -> smoothed cursor coordinates
                         span_x = max(1e-5, 1.0 - self.margin_left - self.margin_right)
                         span_y = max(1e-5, 1.0 - self.margin_top - self.margin_bottom)
@@ -639,38 +864,37 @@ class HandTrackingWorker(QThread):
 
                         raw_x = norm_x * self.screen_width
                         raw_y = norm_y * self.screen_height
-                        smooth_x, smooth_y = self.smoother.update(raw_x, raw_y, now)
+                        smooth_x, smooth_y = self.smoother.update(
+                            raw_x,
+                            raw_y,
+                            now,
+                            damping_scale=damping_scale,
+                        )
                         self._last_smooth_x, self._last_smooth_y = smooth_x, smooth_y
 
                         self.cursor_moved.emit(smooth_x, smooth_y)
 
-                        # Compute distances for Main Hand gestures
-                        d_mid = _norm_dist(thumb_tip, middle_tip)
-                        d_ring = _norm_dist(thumb_tip, ring_tip)
-                        d_pinky = _norm_dist(thumb_tip, pinky_tip)
-                        d_ring_mcp = _norm_dist(thumb_tip, ring_mcp)
-
                         self._update_main_gesture(
                             "thumb_middle",
                             d_mid,
-                            self.pinch_threshold,
-                            self.release_threshold,
+                            eff_pinch,
+                            eff_release,
                             smooth_x,
                             smooth_y,
                         )
                         self._update_main_gesture(
                             "thumb_ring",
                             d_ring,
-                            self.pinch_threshold,
-                            self.release_threshold,
+                            eff_pinch,
+                            eff_release,
                             smooth_x,
                             smooth_y,
                         )
                         self._update_main_gesture(
                             "thumb_pinky",
                             d_pinky,
-                            self.pinch_threshold,
-                            self.release_threshold,
+                            eff_pinch,
+                            eff_release,
                             smooth_x,
                             smooth_y,
                         )
@@ -679,13 +903,13 @@ class HandTrackingWorker(QThread):
                             self._gesture_pinched["thumb_middle"]
                             or self._gesture_pinched["thumb_ring"]
                             or self._gesture_pinched["thumb_pinky"]
-                            or min(d_mid, d_ring, d_pinky) < 0.075
+                            or min(d_mid, d_ring, d_pinky) < 0.075 * hand_scale
                         )
                         self._update_main_gesture(
                             "thumb_ring_mcp",
                             d_ring_mcp,
-                            self.mmb_pinch_threshold,
-                            self.mmb_release_threshold,
+                            eff_mmb_pinch,
+                            eff_mmb_release,
                             smooth_x,
                             smooth_y,
                             blocked=fingertip_pinch_busy,
@@ -694,10 +918,14 @@ class HandTrackingWorker(QThread):
                         # Additional (2nd) Hand Gestures (Custom + Built-in)
                         sec_action_display = None
                         sec_pinch_pair = None
+                        sec_hold_progress = 0.0
                         if secondary_lms is not None:
+                            sec_scale = _compute_hand_scale_factor(secondary_lms)
                             sec_gesture, sec_pinch_pair = _detect_secondary_gesture(
                                 secondary_lms,
                                 self.custom_gestures,
+                                hand_scale=sec_scale,
+                                sensitivity_mult=sens_mult,
                             )
                             if sec_gesture is not None:
                                 mapped_action = self.secondary_bindings.get(sec_gesture, "none")
@@ -713,8 +941,12 @@ class HandTrackingWorker(QThread):
                                     self._sec_candidate_gesture = sec_gesture
                                     self._sec_hold_frames = 1
 
+                                sec_hold_progress = min(
+                                    1.0, self._sec_hold_frames / float(SECONDARY_HOLD_FRAMES)
+                                )
+
                                 if (
-                                    self._sec_hold_frames == 8
+                                    self._sec_hold_frames == SECONDARY_HOLD_FRAMES
                                     and self._sec_latched_gesture != sec_gesture
                                 ):
                                     self._sec_latched_gesture = sec_gesture
@@ -732,37 +964,40 @@ class HandTrackingWorker(QThread):
                                 if self._sec_neutral_frames >= 4:
                                     self._sec_latched_gesture = None
 
-                        # Draw skeleton meshes and labels on preview frame
-                        active_vals = set(self._gesture_active_action.values())
-                        _draw_hand(
-                            frame,
-                            hand_lms,
-                            w,
-                            h,
-                            lmb_pinched="left_click" in active_vals,
-                            rmb_pinched="right_click" in active_vals,
-                            hold_pinched="hold_lmb" in active_vals,
-                            mmb_pinched="hold_mmb" in active_vals,
-                        )
-                        mwx, mwy = int(hand_lms[WRIST].x * w), int(hand_lms[WRIST].y * h)
-                        cv2.putText(
-                            frame,
-                            "MAIN",
-                            (max(10, mwx - 25), min(h - 10, mwy + 25)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            (100, 255, 180),
-                            2,
-                        )
-                        if secondary_lms is not None:
-                            _draw_secondary_hand(
+                        # Draw skeleton meshes and labels on preview frame only when preview is visible
+                        if self.preview_enabled or self.show_cv_window:
+                            active_vals = set(self._gesture_active_action.values())
+                            _draw_hand(
                                 frame,
-                                secondary_lms,
+                                hand_lms,
                                 w,
                                 h,
-                                active_label=sec_action_display,
-                                active_pinch_pair=sec_pinch_pair,
+                                lmb_pinched="left_click" in active_vals or "double_click" in active_vals,
+                                rmb_pinched="right_click" in active_vals,
+                                hold_pinched="hold_lmb" in active_vals,
+                                mmb_pinched="hold_mmb" in active_vals,
+                                stabilized=is_stabilized,
                             )
+                            mwx, mwy = int(hand_lms[WRIST].x * w), int(hand_lms[WRIST].y * h)
+                            cv2.putText(
+                                frame,
+                                "MAIN",
+                                (max(10, mwx - 25), min(h - 10, mwy + 25)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.55,
+                                (100, 255, 180),
+                                2,
+                            )
+                            if secondary_lms is not None:
+                                _draw_secondary_hand(
+                                    frame,
+                                    secondary_lms,
+                                    w,
+                                    h,
+                                    active_label=sec_action_display,
+                                    active_pinch_pair=sec_pinch_pair,
+                                    hold_progress=sec_hold_progress,
+                                )
                     else:
                         self._main_wrist_pos = None
                         self._sec_candidate_gesture = None
@@ -777,46 +1012,56 @@ class HandTrackingWorker(QThread):
                             if lost_hand_frames > 10:
                                 self._release_all_gestures()
 
-                    # Draw active screen mapping zone (orange box + corner handles) and HUD text
-                    box_x1 = int(self.margin_left * w)
-                    box_y1 = int(self.margin_top * h)
-                    box_x2 = int((1.0 - self.margin_right) * w)
-                    box_y2 = int((1.0 - self.margin_bottom) * h)
-                    cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (40, 175, 255), 2)
-                    for cx, cy in ((box_x1, box_y1), (box_x2, box_y1), (box_x1, box_y2), (box_x2, box_y2)):
-                        cv2.rectangle(frame, (cx - 5, cy - 5), (cx + 5, cy + 5), (40, 175, 255), cv2.FILLED)
+                    if self.preview_enabled or self.show_cv_window:
+                        # Draw active screen mapping zone (orange box + corner handles) and HUD text
+                        box_x1 = int(self.margin_left * w)
+                        box_y1 = int(self.margin_top * h)
+                        box_x2 = int((1.0 - self.margin_right) * w)
+                        box_y2 = int((1.0 - self.margin_bottom) * h)
+                        cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (40, 175, 255), 2)
+                        for cx, cy in ((box_x1, box_y1), (box_x2, box_y1), (box_x1, box_y2), (box_x2, box_y2)):
+                            cv2.rectangle(frame, (cx - 5, cy - 5), (cx + 5, cy + 5), (40, 175, 255), cv2.FILLED)
 
-                    cv2.putText(
-                        frame,
-                        f"Default Main: {self.preferred_main_hand} (F2 to swap)",
-                        (12, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (220, 240, 255),
-                        2,
-                    )
-                    if now - self._last_sec_banner_time < 1.2 and self._last_sec_banner:
                         cv2.putText(
                             frame,
-                            self._last_sec_banner,
-                            (12, 52),
+                            f"Default Main: {self.preferred_main_hand} (F2 swap | F4 pause)",
+                            (12, 24),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65,
-                            (120, 255, 180),
+                            0.52,
+                            (220, 240, 255),
                             2,
                         )
+                        cv2.putText(
+                            frame,
+                            f"{current_fps:.0f} FPS",
+                            (w - 78, 24),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.52,
+                            (140, 255, 190),
+                            2,
+                        )
+                        if now - self._last_sec_banner_time < 1.2 and self._last_sec_banner:
+                            cv2.putText(
+                                frame,
+                                self._last_sec_banner,
+                                (12, 52),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.65,
+                                (120, 255, 180),
+                                2,
+                            )
 
-                    # Emit annotated frame as QImage for the Qt main window preview
-                    rgb_preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    bytes_per_line = 3 * w
-                    q_img = QImage(
-                        rgb_preview.data,
-                        w,
-                        h,
-                        bytes_per_line,
-                        QImage.Format.Format_RGB888,
-                    ).copy()
-                    self.frame_ready.emit(q_img)
+                        # Emit annotated frame as QImage for the Qt main window preview
+                        rgb_preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        bytes_per_line = 3 * w
+                        q_img = QImage(
+                            rgb_preview.data,
+                            w,
+                            h,
+                            bytes_per_line,
+                            QImage.Format.Format_RGB888,
+                        ).copy()
+                        self.frame_ready.emit(q_img)
 
                     if self.show_cv_window:
                         cv2.imshow(window_name, frame)

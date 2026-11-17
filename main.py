@@ -109,14 +109,18 @@ def main() -> int:
         on_toggle_keyboard=virtual_keyboard.toggle_visibility,
     )
 
-    # System tray icon & menu for reopening or fully quitting Cam-Glove
+    # System tray icon & menu for reopening, pausing, or fully quitting Cam-Glove
     tray_icon = QSystemTrayIcon(app_icon, app)
-    tray_icon.setToolTip("Cam-Glove — Hand Tracking Control Center")
+    tray_icon.setToolTip("Cam-Glove — Hand Tracking Control Center (Active)")
 
     tray_menu = QMenu()
     open_action = QAction("Open Cam-Glove", tray_menu)
     open_action.triggered.connect(main_window.restore_from_tray)
     tray_menu.addAction(open_action)
+
+    pause_action = QAction("Pause Tracking (F4)", tray_menu)
+    pause_action.triggered.connect(tracker.toggle_paused)
+    tray_menu.addAction(pause_action)
 
     vk_action = QAction("Open / Hide Virtual Keyboard", tray_menu)
     vk_action.triggered.connect(virtual_keyboard.toggle_visibility)
@@ -133,6 +137,17 @@ def main() -> int:
     tray_menu.addAction(quit_action)
 
     tray_icon.setContextMenu(tray_menu)
+
+    def on_paused_changed(paused: bool) -> None:
+        if paused:
+            input_controller.release_all()
+            pause_action.setText("Resume Tracking (F4)")
+            tray_icon.setToolTip("Cam-Glove — Tracking PAUSED (Press F4 to Resume)")
+        else:
+            pause_action.setText("Pause Tracking (F4)")
+            tray_icon.setToolTip("Cam-Glove — Hand Tracking Control Center (Active)")
+
+    tracker.tracking_paused_changed.connect(on_paused_changed)
 
     def on_tray_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
@@ -155,12 +170,14 @@ def main() -> int:
     sigint_timer.timeout.connect(lambda: None)
     sigint_timer.start()
 
-    # Global hotkey: F2 to swap Main Hand (Right <-> Left)
+    # Global hotkeys: F2 to swap Main Hand (Right <-> Left), F4 to Pause/Resume Tracking
     kb_listener = None
     if pynput_keyboard is not None:
         def on_press(key) -> None:
             if key == pynput_keyboard.Key.f2:
                 tracker.swap_active_main_hand()
+            elif key == pynput_keyboard.Key.f4:
+                tracker.toggle_paused()
 
         kb_listener = pynput_keyboard.Listener(on_press=on_press)
         kb_listener.daemon = True

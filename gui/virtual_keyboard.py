@@ -3,7 +3,7 @@ import ctypes.wintypes
 import sys
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,6 +44,7 @@ VK_MAP: Dict[str, int] = {
 }
 
 EXTENDED_VKS = {0x25, 0x26, 0x27, 0x28, 0x2E, 0x5B}
+REPEATABLE_KEYS = {"BACKSPACE", "DELETE", "SPACE", "LEFT", "UP", "RIGHT", "DOWN"}
 
 SHIFT_MAP: Dict[str, str] = {
     "`": "~",
@@ -239,6 +240,20 @@ class VirtualKeyboardWindow(QWidget):
         self._hand_dragging = False
         self._hovered_btn: Optional[QPushButton] = None
         self._key_buttons: Dict[str, List[QPushButton]] = {}
+        self._btn_to_key_id: Dict[QPushButton, str] = {}
+        self._opacity_levels = [0.96, 0.78, 0.60]
+        self._opacity_idx = 0
+        self.setWindowOpacity(self._opacity_levels[0])
+
+        # Key auto-repeat timer when holding pinch on Backspace / Space / Arrow keys
+        self._held_key_id: Optional[str] = None
+        self._repeat_delay_timer = QTimer(self)
+        self._repeat_delay_timer.setSingleShot(True)
+        self._repeat_delay_timer.setInterval(420)
+        self._repeat_tick_timer = QTimer(self)
+        self._repeat_tick_timer.setInterval(75)
+        self._repeat_delay_timer.timeout.connect(self._repeat_tick_timer.start)
+        self._repeat_tick_timer.timeout.connect(self._on_repeat_tick)
 
         self.setFixedSize(880, 320)
         self._position_bottom_center()
@@ -267,14 +282,28 @@ class VirtualKeyboardWindow(QWidget):
         self.title_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         header.addWidget(self.title_label, stretch=1)
 
-        for label, key_id in (("Esc", "ESC"), ("Copy", "COPY"), ("Paste", "PASTE")):
+        for label, key_id in (
+            ("Esc", "ESC"),
+            ("Undo", "UNDO"),
+            ("Copy", "COPY"),
+            ("Paste", "PASTE"),
+        ):
             btn = QPushButton(label, self)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setFixedHeight(28)
-            btn.setMinimumWidth(64)
+            btn.setMinimumWidth(60)
             btn.setProperty("role", "header_btn")
+            self._btn_to_key_id[btn] = key_id
             btn.clicked.connect(lambda _checked=False, k=key_id: self._on_key_clicked(k))
             header.addWidget(btn)
+
+        self.opacity_btn = QPushButton("◐ 95%", self)
+        self.opacity_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.opacity_btn.setFixedHeight(28)
+        self.opacity_btn.setMinimumWidth(64)
+        self.opacity_btn.setProperty("role", "header_btn")
+        self.opacity_btn.clicked.connect(self._cycle_opacity)
+        header.addWidget(self.opacity_btn)
 
         close_btn = QPushButton("✕ Close", self)
         close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -298,9 +327,27 @@ class VirtualKeyboardWindow(QWidget):
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 norm_id = "SHIFT" if key_id == "SHIFT_R" else key_id
                 self._key_buttons.setdefault(norm_id, []).append(btn)
+                self._btn_to_key_id[btn] = norm_id
                 btn.clicked.connect(lambda _checked=False, k=norm_id: self._on_key_clicked(k))
                 row_layout.addWidget(btn, stretch=stretch)
             root.addLayout(row_layout)
+
+    def _cycle_opacity(self) -> None:
+        self._opacity_idx = (self._opacity_idx + 1) % len(self._opacity_levels)
+        op = self._opacity_levels[self._opacity_idx]
+        self.setWindowOpacity(op)
+        self.opacity_btn.setText(f"◐ {int(round(op * 100))}%")
+
+    def _on_repeat_tick(self) -> None:
+        if self._held_key_id in REPEATABLE_KEYS:
+            self._on_key_clicked(self._held_key_id)
+        else:
+            self._stop_key_repeat()
+
+    def _stop_key_repeat(self) -> None:
+        self._held_key_id = None
+        self._repeat_delay_timer.stop()
+        self._repeat_tick_timer.stop()
 
     def _apply_styles(self) -> None:
         self.setStyleSheet(
@@ -360,6 +407,10 @@ class VirtualKeyboardWindow(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self._apply_win32_noactivate()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        self._stop_key_repeat()
+        super().hideEvent(event)
 
     def _apply_win32_noactivate(self) -> None:
         if sys.platform != "win32":
@@ -424,6 +475,11 @@ class VirtualKeyboardWindow(QWidget):
             self._update_key_labels()
             return
 
+        if key_id == "UNDO":
+            _key_down_vk(VK_MAP["CTRL"])
+            _tap_vk(0x5A)  # Z
+            _key_up_vk(VK_MAP["CTRL"])
+            return
         if key_id == "COPY":
             _key_down_vk(VK_MAP["CTRL"])
             _tap_vk(0x43)  # C
@@ -533,14 +589,14 @@ class VirtualKeyboardWindow(QWidget):
         pt = QPoint(int(round(x)), int(round(y)))
         if not self.isVisible() or not self.frameGeometry().contains(pt):
             return False
-        if button.lower() == "left":
+        if button.lower() in ("left", "double"):
             btn = self._button_at_global(x, y)
             if btn is not None:
                 btn.animateClick()
         return True
 
     def handle_virtual_mouse_down(self, button: str, x: float, y: float) -> bool:
-        """Support hand click-and-hold on keys or dragging the virtual keyboard title bar."""
+        """Support hand click-and-hold on keys (with auto-repeat) or dragging the keyboard header bar."""
         pt = QPoint(int(round(x)), int(round(y)))
         if not self.isVisible() or not self.frameGeometry().contains(pt):
             return False
@@ -548,6 +604,10 @@ class VirtualKeyboardWindow(QWidget):
             btn = self._button_at_global(x, y)
             if btn is not None:
                 btn.animateClick()
+                key_id = self._btn_to_key_id.get(btn)
+                if key_id in REPEATABLE_KEYS:
+                    self._held_key_id = key_id
+                    self._repeat_delay_timer.start()
             else:
                 local_pt = self.mapFromGlobal(pt)
                 if local_pt.y() <= 46:
@@ -556,10 +616,10 @@ class VirtualKeyboardWindow(QWidget):
         return True
 
     def handle_virtual_mouse_up(self, button: str, x: float, y: float) -> bool:
+        self._stop_key_repeat()
         if self._hand_dragging and button.lower() == "left":
             self._hand_dragging = False
             self._drag_offset = None
             return True
         pt = QPoint(int(round(x)), int(round(y)))
         return self.isVisible() and self.frameGeometry().contains(pt)
-

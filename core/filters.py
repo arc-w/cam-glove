@@ -17,13 +17,20 @@ class EMAFilter2D:
         self._x = None
         self._y = None
 
-    def update(self, x: float, y: float, timestamp: Optional[float] = None) -> Tuple[float, float]:
+    def update(
+        self,
+        x: float,
+        y: float,
+        timestamp: Optional[float] = None,
+        damping_scale: float = 1.0,
+    ) -> Tuple[float, float]:
         if self._x is None or self._y is None:
             self._x = x
             self._y = y
         else:
-            self._x = self.alpha * x + (1.0 - self.alpha) * self._x
-            self._y = self.alpha * y + (1.0 - self.alpha) * self._y
+            eff_alpha = max(0.02, min(1.0, self.alpha * damping_scale))
+            self._x = eff_alpha * x + (1.0 - eff_alpha) * self._x
+            self._y = eff_alpha * y + (1.0 - eff_alpha) * self._y
         return self._x, self._y
 
 
@@ -53,7 +60,12 @@ class _OneEuroFilter1D:
         self._dx_prev = 0.0
         self._t_prev = None
 
-    def update(self, x: float, t: Optional[float] = None) -> float:
+    def update(
+        self,
+        x: float,
+        t: Optional[float] = None,
+        damping_scale: float = 1.0,
+    ) -> float:
         now = time.monotonic() if t is None else t
         if self._x_prev is None or self._t_prev is None:
             self._x_prev = x
@@ -68,8 +80,9 @@ class _OneEuroFilter1D:
         dx = (x - self._x_prev) / t_e
         dx_hat = a_d * dx + (1.0 - a_d) * self._dx_prev
 
-        # Adaptive cutoff frequency
-        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        # Adaptive cutoff frequency (scaled down during pinch-anchor stabilization)
+        scale = max(0.05, min(2.0, damping_scale))
+        cutoff = (self.min_cutoff * scale) + (self.beta * scale * scale) * abs(dx_hat)
         a = self._smoothing_factor(t_e, cutoff)
         x_hat = a * x + (1.0 - a) * self._x_prev
 
@@ -91,10 +104,27 @@ class OneEuroFilter2D:
         self._fx = _OneEuroFilter1D(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
         self._fy = _OneEuroFilter1D(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
 
+    def set_params(self, min_cutoff: float, beta: float, d_cutoff: float = 1.0) -> None:
+        self._fx.min_cutoff = min_cutoff
+        self._fx.beta = beta
+        self._fx.d_cutoff = d_cutoff
+        self._fy.min_cutoff = min_cutoff
+        self._fy.beta = beta
+        self._fy.d_cutoff = d_cutoff
+
     def reset(self) -> None:
         self._fx.reset()
         self._fy.reset()
 
-    def update(self, x: float, y: float, timestamp: Optional[float] = None) -> Tuple[float, float]:
+    def update(
+        self,
+        x: float,
+        y: float,
+        timestamp: Optional[float] = None,
+        damping_scale: float = 1.0,
+    ) -> Tuple[float, float]:
         t = time.monotonic() if timestamp is None else timestamp
-        return self._fx.update(x, t), self._fy.update(y, t)
+        return (
+            self._fx.update(x, t, damping_scale=damping_scale),
+            self._fy.update(y, t, damping_scale=damping_scale),
+        )

@@ -23,19 +23,34 @@ MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
+KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
+VK_TAB = 0x09
+VK_SHIFT = 0x10
 VK_CONTROL = 0x11
 VK_LWIN = 0x5B
+VK_A = 0x41
 VK_C = 0x43
 VK_D = 0x44
 VK_O = 0x4F
+VK_S = 0x53
 VK_V = 0x56
+VK_Z = 0x5A
+
+# Media & Volume Virtual Keys
+VK_VOLUME_MUTE = 0xAD
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP = 0xAF
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_PLAY_PAUSE = 0xB3
 
 
 class InputController(QObject):
-    """Dispatches LMB/MMB click-and-hold and LMB/RMB clicks without hijacking the OS cursor when idle."""
+    """Dispatches LMB/MMB click-and-hold, clicks, wheel scrolls, media keys, and shortcuts."""
 
     toggle_virtual_keyboard_requested = Signal()
 
@@ -163,9 +178,23 @@ class InputController(QObject):
             elif self._pynput_mouse is not None and Button is not None:
                 self._pynput_mouse.release(Button.middle)
 
+    def _send_wheel(self, notches: int) -> None:
+        """Scroll mouse wheel vertically (positive = up, negative = down)."""
+        if self._is_windows:
+            delta = int(notches * 120)
+            ctypes.windll.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+        elif self._pynput_mouse is not None:
+            self._pynput_mouse.scroll(0, notches)
+
+    def _tap_extended_vk(self, vk: int) -> None:
+        if self._is_windows:
+            user32 = ctypes.windll.user32
+            user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+            user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+
     @Slot(str)
     def trigger_secondary_action(self, action: str) -> None:
-        """Execute secondary hand actions ('copy', 'paste', 'show_desktop', 'open_osk', or 'exec:<path>')."""
+        """Execute secondary/shortcut actions ('copy', 'paste', 'scroll_up', media, or 'exec:<path>')."""
         if action.startswith("exec:"):
             target_path = action[5:].strip()
             if target_path:
@@ -175,6 +204,30 @@ class InputController(QObject):
         act = action.lower()
         if act == "open_osk":
             self._open_virtual_keyboard()
+            return
+        if act == "scroll_up":
+            self._send_wheel(4)
+            return
+        if act == "scroll_down":
+            self._send_wheel(-4)
+            return
+        if act == "media_play_pause":
+            self._tap_extended_vk(VK_MEDIA_PLAY_PAUSE)
+            return
+        if act == "media_next":
+            self._tap_extended_vk(VK_MEDIA_NEXT_TRACK)
+            return
+        if act == "media_prev":
+            self._tap_extended_vk(VK_MEDIA_PREV_TRACK)
+            return
+        if act == "vol_up":
+            self._tap_extended_vk(VK_VOLUME_UP)
+            return
+        if act == "vol_down":
+            self._tap_extended_vk(VK_VOLUME_DOWN)
+            return
+        if act == "vol_mute":
+            self._tap_extended_vk(VK_VOLUME_MUTE)
             return
 
         if self._is_windows:
@@ -189,10 +242,32 @@ class InputController(QObject):
                 user32.keybd_event(VK_V, 0, 0, 0)
                 user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
                 user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            elif act == "undo":
+                user32.keybd_event(VK_CONTROL, 0, 0, 0)
+                user32.keybd_event(VK_Z, 0, 0, 0)
+                user32.keybd_event(VK_Z, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            elif act == "select_all":
+                user32.keybd_event(VK_CONTROL, 0, 0, 0)
+                user32.keybd_event(VK_A, 0, 0, 0)
+                user32.keybd_event(VK_A, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
             elif act == "show_desktop":
                 user32.keybd_event(VK_LWIN, 0, 0, 0)
                 user32.keybd_event(VK_D, 0, 0, 0)
                 user32.keybd_event(VK_D, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+            elif act == "task_view":
+                user32.keybd_event(VK_LWIN, 0, 0, 0)
+                user32.keybd_event(VK_TAB, 0, 0, 0)
+                user32.keybd_event(VK_TAB, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+            elif act == "screenshot":
+                user32.keybd_event(VK_LWIN, 0, 0, 0)
+                user32.keybd_event(VK_SHIFT, 0, 0, 0)
+                user32.keybd_event(VK_S, 0, 0, 0)
+                user32.keybd_event(VK_S, 0, KEYEVENTF_KEYUP, 0)
+                user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
                 user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
         elif self._pynput_kb is not None and Key is not None:
             if act == "copy":
@@ -201,6 +276,12 @@ class InputController(QObject):
             elif act == "paste":
                 with self._pynput_kb.pressed(Key.ctrl):
                     self._pynput_kb.tap("v")
+            elif act == "undo":
+                with self._pynput_kb.pressed(Key.ctrl):
+                    self._pynput_kb.tap("z")
+            elif act == "select_all":
+                with self._pynput_kb.pressed(Key.ctrl):
+                    self._pynput_kb.tap("a")
             elif act == "show_desktop":
                 with self._pynput_kb.pressed(Key.cmd):
                     self._pynput_kb.tap("d")
@@ -221,15 +302,23 @@ class InputController(QObject):
 
     @Slot(str, float, float)
     def trigger_click(self, button: str, x: float, y: float) -> None:
-        """Dispatch a single mouse click ('left' or 'right') at virtual cursor coordinates (x, y)."""
+        """Dispatch a single or double mouse click ('left', 'right', or 'double') at (x, y)."""
         btn = button.lower()
+        if btn == "double":
+            if self._is_windows:
+                self._click_winapi("left", x, y)
+                self._click_winapi("left", x, y)
+            elif self._pynput_mouse is not None and Button is not None:
+                self._click_pynput("left", x, y, count=2)
+            return
+
         if btn not in ("left", "right"):
             return
 
         if self._is_windows:
             self._click_winapi(btn, x, y)
         elif self._pynput_mouse is not None and Button is not None:
-            self._click_pynput(btn, x, y)
+            self._click_pynput(btn, x, y, count=1)
 
     def _click_winapi(self, button: str, x: float, y: float) -> None:
         user32 = ctypes.windll.user32
@@ -253,7 +342,7 @@ class InputController(QObject):
         if self.restore_cursor:
             user32.SetCursorPos(prev_pt.x, prev_pt.y)
 
-    def _click_pynput(self, button: str, x: float, y: float) -> None:
+    def _click_pynput(self, button: str, x: float, y: float, count: int = 1) -> None:
         if self._pynput_mouse is None or Button is None:
             return
         prev_pos = self._pynput_mouse.position if self.restore_cursor else None
@@ -262,7 +351,7 @@ class InputController(QObject):
 
         self._pynput_mouse.position = (phys_x, phys_y)
         pynput_btn = Button.left if button == "left" else Button.right
-        self._pynput_mouse.click(pynput_btn, 1)
+        self._pynput_mouse.click(pynput_btn, count)
 
         if prev_pos is not None:
             self._pynput_mouse.position = prev_pos

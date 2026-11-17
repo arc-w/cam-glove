@@ -4,8 +4,20 @@ import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, Qt, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QCloseEvent,
+    QColor,
+    QHideEvent,
+    QIcon,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShowEvent,
+)
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
@@ -51,13 +63,26 @@ SECONDARY_GESTURE_LABELS: List[Tuple[str, str]] = [
 
 MAIN_ACTION_OPTIONS: List[Tuple[str, str]] = [
     ("left_click", "Left Click (LMB)"),
+    ("double_click", "Double Click (2x LMB)"),
     ("right_click", "Right Click (RMB)"),
     ("hold_lmb", "Click & Hold / Drag (LMB)"),
     ("hold_mmb", "Middle Mouse / Scroll (MMB)"),
+    ("scroll_up", "Scroll Wheel Up"),
+    ("scroll_down", "Scroll Wheel Down"),
     ("copy", "Copy (Ctrl+C)"),
     ("paste", "Paste (Ctrl+V)"),
+    ("undo", "Undo (Ctrl+Z)"),
+    ("select_all", "Select All (Ctrl+A)"),
     ("show_desktop", "Show Desktop (Win+D)"),
+    ("task_view", "Task View (Win+Tab)"),
+    ("screenshot", "Screenshot (Win+Shift+S)"),
     ("open_osk", "Open Virtual Keyboard"),
+    ("media_play_pause", "Media Play / Pause"),
+    ("media_next", "Media Next Track"),
+    ("media_prev", "Media Previous Track"),
+    ("vol_up", "Volume Up"),
+    ("vol_down", "Volume Down"),
+    ("vol_mute", "Mute / Unmute Audio"),
     (PICK_EXEC_SENTINEL, "Execute Program / File..."),
     ("none", "Disabled"),
 ]
@@ -65,10 +90,23 @@ MAIN_ACTION_OPTIONS: List[Tuple[str, str]] = [
 SECONDARY_ACTION_OPTIONS: List[Tuple[str, str]] = [
     ("copy", "Copy (Ctrl+C)"),
     ("paste", "Paste (Ctrl+V)"),
+    ("undo", "Undo (Ctrl+Z)"),
+    ("select_all", "Select All (Ctrl+A)"),
     ("show_desktop", "Show Desktop (Win+D)"),
+    ("task_view", "Task View (Win+Tab)"),
+    ("screenshot", "Screenshot (Win+Shift+S)"),
     ("open_osk", "Open Virtual Keyboard"),
     ("left_click", "Left Click (LMB)"),
+    ("double_click", "Double Click (2x LMB)"),
     ("right_click", "Right Click (RMB)"),
+    ("scroll_up", "Scroll Wheel Up"),
+    ("scroll_down", "Scroll Wheel Down"),
+    ("media_play_pause", "Media Play / Pause"),
+    ("media_next", "Media Next Track"),
+    ("media_prev", "Media Previous Track"),
+    ("vol_up", "Volume Up"),
+    ("vol_down", "Volume Down"),
+    ("vol_mute", "Mute / Unmute Audio"),
     (PICK_EXEC_SENTINEL, "Execute Program / File..."),
     ("none", "Disabled"),
 ]
@@ -288,7 +326,8 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Cam-Glove — Hand Tracking Control Center")
         self.setWindowIcon(create_app_icon())
-        self.resize(1080, 660)
+        self.resize(1120, 700)
+        self._apply_dark_theme()
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -296,12 +335,35 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(14)
 
-        # Left side: Camera Preview (interactive orange box)
+        # Left side: Camera Preview (interactive orange box + status bar)
         preview_group = QGroupBox(
             "Camera Preview (Index 8 = Cursor | Drag Orange Box or Corners to Adjust Area)",
             self,
         )
         preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setSpacing(8)
+
+        # Status bar above preview
+        status_row = QHBoxLayout()
+        self.status_badge = QLabel("● TRACKING ACTIVE", self)
+        self.status_badge.setStyleSheet(
+            "background-color: #133829; color: #50ffaa; font-weight: bold; "
+            "padding: 4px 10px; border-radius: 5px; border: 1px solid #257552;"
+        )
+        status_row.addWidget(self.status_badge)
+
+        self.pause_btn = QPushButton("⏸ Pause Tracking (F4)", self)
+        self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pause_btn.clicked.connect(self.tracker.toggle_paused)
+        status_row.addWidget(self.pause_btn)
+
+        status_row.addStretch(1)
+
+        self.fps_label = QLabel("-- FPS", self)
+        self.fps_label.setStyleSheet("color: #98b4d4; font-weight: 600;")
+        status_row.addWidget(self.fps_label)
+        preview_layout.addLayout(status_row)
+
         self.preview_label = InteractivePreviewLabel(
             tracker=self.tracker,
             on_roi_changed=self._on_preview_roi_dragged,
@@ -309,8 +371,10 @@ class MainWindow(QMainWindow):
         )
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(580, 460)
-        self.preview_label.setStyleSheet("background-color: #181818; color: #cccccc;")
-        preview_layout.addWidget(self.preview_label)
+        self.preview_label.setStyleSheet(
+            "background-color: #10131a; color: #cccccc; border: 1px solid #263042; border-radius: 6px;"
+        )
+        preview_layout.addWidget(self.preview_label, stretch=1)
         root_layout.addWidget(preview_group, stretch=3)
 
         # Right side: Scrollable Settings & Gesture Remapping
@@ -320,19 +384,27 @@ class MainWindow(QMainWindow):
 
         controls_panel = QWidget(scroll_area)
         controls_layout = QVBoxLayout(controls_panel)
-        controls_layout.setContentsMargins(0, 0, 4, 0)
+        controls_layout.setContentsMargins(0, 0, 6, 0)
         controls_layout.setSpacing(10)
 
-        # 1. Hand Priority Group
-        hand_group = QGroupBox("Hand Priority", self)
+        # 1. Hand Priority & Device Group
+        hand_group = QGroupBox("Hand Priority & Camera", self)
         hand_form = QFormLayout(hand_group)
+
+        self.camera_combo = QComboBox(self)
+        self.camera_combo.addItem("Camera 0 (Default)", 0)
+        self.camera_combo.addItem("Camera 1", 1)
+        self.camera_combo.addItem("Camera 2", 2)
+        self.camera_combo.currentIndexChanged.connect(self._on_camera_combo_changed)
+        hand_form.addRow("Webcam Device:", self.camera_combo)
+
         self.main_hand_combo = QComboBox(self)
         self.main_hand_combo.addItem("Right Hand", "Right")
         self.main_hand_combo.addItem("Left Hand", "Left")
         self.main_hand_combo.currentIndexChanged.connect(self._on_main_hand_combo_changed)
         hand_form.addRow("Default Main Hand:", self.main_hand_combo)
 
-        self.swap_hand_btn = QPushButton("Swap Active Main Hand (F2)", self)
+        self.swap_hand_btn = QPushButton("⇄ Swap Active Main Hand (F2)", self)
         self.swap_hand_btn.clicked.connect(self.tracker.swap_active_main_hand)
         hand_form.addRow("", self.swap_hand_btn)
 
@@ -343,7 +415,48 @@ class MainWindow(QMainWindow):
 
         controls_layout.addWidget(hand_group)
 
-        # 1b. Cursor Mapping Area (Orange Box) Group
+        # 1b. Cursor Feel & Pinch Precision Group
+        feel_group = QGroupBox("Cursor Smoothness & Pinch Precision", self)
+        feel_form = QFormLayout(feel_group)
+
+        smooth_row = QWidget(feel_group)
+        smooth_h = QHBoxLayout(smooth_row)
+        smooth_h.setContentsMargins(0, 0, 0, 0)
+        smooth_h.setSpacing(8)
+        self.smoothing_slider = QSlider(Qt.Orientation.Horizontal, smooth_row)
+        self.smoothing_slider.setRange(1, 100)
+        self.smoothing_slider.setValue(50)
+        self.smoothing_val_lbl = QLabel("50%", smooth_row)
+        self.smoothing_val_lbl.setFixedWidth(38)
+        self.smoothing_val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.smoothing_slider.valueChanged.connect(self._on_feel_changed)
+        smooth_h.addWidget(self.smoothing_slider, stretch=1)
+        smooth_h.addWidget(self.smoothing_val_lbl)
+        feel_form.addRow("Cursor Smoothing:", smooth_row)
+
+        sens_row = QWidget(feel_group)
+        sens_h = QHBoxLayout(sens_row)
+        sens_h.setContentsMargins(0, 0, 0, 0)
+        sens_h.setSpacing(8)
+        self.sensitivity_slider = QSlider(Qt.Orientation.Horizontal, sens_row)
+        self.sensitivity_slider.setRange(60, 140)
+        self.sensitivity_slider.setValue(100)
+        self.sensitivity_val_lbl = QLabel("100%", sens_row)
+        self.sensitivity_val_lbl.setFixedWidth(38)
+        self.sensitivity_val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.sensitivity_slider.valueChanged.connect(self._on_feel_changed)
+        sens_h.addWidget(self.sensitivity_slider, stretch=1)
+        sens_h.addWidget(self.sensitivity_val_lbl)
+        feel_form.addRow("Pinch Sensitivity:", sens_row)
+
+        self.stabilize_checkbox = QCheckBox("Anchor cursor on pinch (anti-slip clicks)", feel_group)
+        self.stabilize_checkbox.setChecked(True)
+        self.stabilize_checkbox.toggled.connect(self._on_feel_changed)
+        feel_form.addRow("", self.stabilize_checkbox)
+
+        controls_layout.addWidget(feel_group)
+
+        # 1c. Cursor Mapping Area (Orange Box) Group
         roi_group = QGroupBox("Cursor Mapping Area (Orange Box)", self)
         roi_layout = QVBoxLayout(roi_group)
         roi_hint = QLabel(
@@ -351,7 +464,7 @@ class MainWindow(QMainWindow):
             roi_group,
         )
         roi_hint.setWordWrap(True)
-        roi_hint.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        roi_hint.setStyleSheet("color: #96a4ba; font-size: 11px;")
         roi_layout.addWidget(roi_hint)
 
         roi_form = QFormLayout()
@@ -428,7 +541,7 @@ class MainWindow(QMainWindow):
 
         # 4. Reset button
         btn_row = QHBoxLayout()
-        self.reset_btn = QPushButton("Reset to Defaults", self)
+        self.reset_btn = QPushButton("Reset All to Defaults", self)
         self.reset_btn.clicked.connect(self._reset_defaults)
         btn_row.addWidget(self.reset_btn)
         controls_layout.addLayout(btn_row)
@@ -440,11 +553,113 @@ class MainWindow(QMainWindow):
         # Connect tracker signals
         self.tracker.frame_ready.connect(self.update_preview_frame)
         self.tracker.main_hand_changed.connect(self._sync_main_hand_combo)
+        self.tracker.tracking_paused_changed.connect(self._on_tracking_paused_changed)
+        self.tracker.fps_updated.connect(self._on_fps_updated)
 
         # Load persisted settings (if any) and sync UI
         self._load_settings()
         self._rebuild_custom_gesture_rows()
         self._sync_ui_from_tracker()
+
+    def _apply_dark_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QDialog {
+                background-color: #141821;
+                color: #e6edf7;
+            }
+            QWidget {
+                color: #e6edf7;
+                font-family: "Segoe UI", sans-serif;
+                font-size: 12px;
+            }
+            QGroupBox {
+                background-color: #1b202c;
+                border: 1px solid #2b3448;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding: 12px 10px 10px 10px;
+                font-weight: bold;
+                color: #8ad4ff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+            }
+            QComboBox, QLineEdit, QListWidget {
+                background-color: #232a3a;
+                border: 1px solid #38445e;
+                border-radius: 5px;
+                padding: 4px 8px;
+                color: #f0f5ff;
+            }
+            QComboBox:hover, QLineEdit:hover {
+                border: 1px solid #00c8ff;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e2433;
+                color: #f0f5ff;
+                selection-background-color: #0078a8;
+            }
+            QPushButton {
+                background-color: #252e40;
+                border: 1px solid #3c4a66;
+                border-radius: 5px;
+                padding: 6px 12px;
+                color: #f0f5ff;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #2f3d56;
+                border: 1px solid #00d4ff;
+            }
+            QPushButton:pressed {
+                background-color: #0098c8;
+                color: #10141d;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #283144;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #00b8f0;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #60e8ff;
+                border: 1px solid #ffffff;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            QScrollArea {
+                background: transparent;
+            }
+            """
+        )
+
+    @Slot(float)
+    def _on_fps_updated(self, fps: float) -> None:
+        self.fps_label.setText(f"{fps:.0f} FPS")
+
+    @Slot(bool)
+    def _on_tracking_paused_changed(self, paused: bool) -> None:
+        if paused:
+            self.status_badge.setText("⏸ TRACKING PAUSED")
+            self.status_badge.setStyleSheet(
+                "background-color: #3d2c14; color: #ffbe55; font-weight: bold; "
+                "padding: 4px 10px; border-radius: 5px; border: 1px solid #8a6220;"
+            )
+            self.pause_btn.setText("▶ Resume Tracking (F4)")
+        else:
+            self.status_badge.setText("● TRACKING ACTIVE")
+            self.status_badge.setStyleSheet(
+                "background-color: #133829; color: #50ffaa; font-weight: bold; "
+                "padding: 4px 10px; border-radius: 5px; border: 1px solid #257552;"
+            )
+            self.pause_btn.setText("⏸ Pause Tracking (F4)")
 
     def _create_action_combo(
         self,
@@ -467,7 +682,6 @@ class MainWindow(QMainWindow):
         if action_key.startswith("exec:"):
             path_str = action_key[5:].strip()
             label = format_exec_label(path_str)
-            # Insert right before "Execute Program / File..."
             pick_idx = combo.findData(PICK_EXEC_SENTINEL)
             insert_at = pick_idx if pick_idx >= 0 else combo.count()
             combo.insertItem(insert_at, label, action_key)
@@ -476,7 +690,6 @@ class MainWindow(QMainWindow):
         return -1
 
     def _rebuild_custom_gesture_rows(self) -> None:
-        # Remove old custom gesture row widgets
         for gid in list(self.sec_combos.keys()):
             if gid not in DEFAULT_SECONDARY_BINDINGS:
                 self.sec_combos.pop(gid, None)
@@ -535,6 +748,27 @@ class MainWindow(QMainWindow):
     def _sync_ui_from_tracker(self) -> None:
         self._sync_main_hand_combo(self.tracker.preferred_main_hand)
         self._sync_roi_sliders_from_tracker()
+
+        cam_idx = self.camera_combo.findData(self.tracker.camera_index)
+        if cam_idx >= 0:
+            self.camera_combo.blockSignals(True)
+            self.camera_combo.setCurrentIndex(cam_idx)
+            self.camera_combo.blockSignals(False)
+
+        self.smoothing_slider.blockSignals(True)
+        self.smoothing_slider.setValue(self.tracker.smoothing_level)
+        self.smoothing_slider.blockSignals(False)
+        self.smoothing_val_lbl.setText(f"{self.tracker.smoothing_level}%")
+
+        self.sensitivity_slider.blockSignals(True)
+        self.sensitivity_slider.setValue(self.tracker.pinch_sensitivity)
+        self.sensitivity_slider.blockSignals(False)
+        self.sensitivity_val_lbl.setText(f"{self.tracker.pinch_sensitivity}%")
+
+        self.stabilize_checkbox.blockSignals(True)
+        self.stabilize_checkbox.setChecked(self.tracker.pinch_stabilization)
+        self.stabilize_checkbox.blockSignals(False)
+
         for g_key, combo in self.main_combos.items():
             act = self.tracker.main_bindings.get(g_key, DEFAULT_MAIN_BINDINGS[g_key])
             combo.blockSignals(True)
@@ -560,9 +794,26 @@ class MainWindow(QMainWindow):
             self.main_hand_combo.setCurrentIndex(idx)
             self.main_hand_combo.blockSignals(False)
 
+    def _on_camera_combo_changed(self) -> None:
+        idx = int(self.camera_combo.currentData())
+        self.tracker.set_camera_index(idx)
+        self._save_settings()
+
     def _on_main_hand_combo_changed(self) -> None:
         hand = str(self.main_hand_combo.currentData())
         self.tracker.set_preferred_main_hand(hand)
+        self._save_settings()
+
+    def _on_feel_changed(self) -> None:
+        smooth_val = self.smoothing_slider.value()
+        sens_val = self.sensitivity_slider.value()
+        stab = self.stabilize_checkbox.isChecked()
+
+        self.smoothing_val_lbl.setText(f"{smooth_val}%")
+        self.sensitivity_val_lbl.setText(f"{sens_val}%")
+        self.tracker.set_smoothing_level(smooth_val)
+        self.tracker.set_pinch_sensitivity(sens_val)
+        self.tracker.pinch_stabilization = stab
         self._save_settings()
 
     def _sync_roi_sliders_from_tracker(self) -> None:
@@ -618,7 +869,6 @@ class MainWindow(QMainWindow):
                     combo.setCurrentIndex(idx)
                 combo.blockSignals(False)
             else:
-                # Restore previous binding on cancel
                 self._sync_ui_from_tracker()
                 return
 
@@ -631,6 +881,7 @@ class MainWindow(QMainWindow):
     def _reset_defaults(self) -> None:
         self.tracker.reset_default_bindings()
         self.tracker.set_preferred_main_hand("Right")
+        self.tracker.pinch_stabilization = True
         self._sync_ui_from_tracker()
         self._save_settings()
 
@@ -643,6 +894,14 @@ class MainWindow(QMainWindow):
                 self.tracker.preferred_main_hand = (
                     "Left" if data["preferred_main_hand"].lower() == "left" else "Right"
                 )
+            if isinstance(data.get("camera_index"), int):
+                self.tracker.camera_index = max(0, int(data["camera_index"]))
+            if isinstance(data.get("smoothing_level"), int):
+                self.tracker.set_smoothing_level(int(data["smoothing_level"]))
+            if isinstance(data.get("pinch_sensitivity"), int):
+                self.tracker.set_pinch_sensitivity(int(data["pinch_sensitivity"]))
+            if isinstance(data.get("pinch_stabilization"), bool):
+                self.tracker.pinch_stabilization = bool(data["pinch_stabilization"])
             if isinstance(data.get("custom_gestures"), list):
                 self.tracker.custom_gestures = [
                     g for g in data["custom_gestures"] if isinstance(g, dict) and "id" in g
@@ -669,6 +928,10 @@ class MainWindow(QMainWindow):
     def _save_settings(self) -> None:
         data = {
             "preferred_main_hand": self.tracker.preferred_main_hand,
+            "camera_index": self.tracker.camera_index,
+            "smoothing_level": self.tracker.smoothing_level,
+            "pinch_sensitivity": self.tracker.pinch_sensitivity,
+            "pinch_stabilization": self.tracker.pinch_stabilization,
             "main_bindings": self.tracker.main_bindings,
             "secondary_bindings": self.tracker.secondary_bindings,
             "custom_gestures": self.tracker.custom_gestures,
@@ -696,8 +959,17 @@ class MainWindow(QMainWindow):
         )
         self.preview_label.setPixmap(scaled)
 
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
+        self.tracker.set_preview_enabled(True)
+        super().showEvent(event)
+
+    def hideEvent(self, event: QHideEvent) -> None:  # noqa: N802
+        self.tracker.set_preview_enabled(False)
+        super().hideEvent(event)
+
     def restore_from_tray(self) -> None:
         """Show and bring the control center window to the foreground from the system tray."""
+        self.tracker.set_preview_enabled(True)
         self.showNormal()
         self.raise_()
         self.activateWindow()
