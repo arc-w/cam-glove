@@ -1,14 +1,19 @@
 import argparse
 import signal
 import sys
+
+if hasattr(sys, "set_lazy_imports_filter"):
+    sys.set_lazy_imports_filter(lambda *_: False)
+
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QAction, QGuiApplication
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from actions.input_controller import InputController
 from core.tracker import HandTrackingWorker
-from gui.main_window import MainWindow
+from gui.main_window import MainWindow, create_app_icon
 from gui.overlay import CursorOverlay
+from gui.virtual_keyboard import VirtualKeyboardWindow
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -27,7 +32,9 @@ def main() -> int:
     args, qt_args = parser.parse_known_args()
 
     app = QApplication([sys.argv[0], *qt_args])
-    app.setQuitOnLastWindowClosed(True)
+    app.setQuitOnLastWindowClosed(False)
+    app_icon = create_app_icon()
+    app.setWindowIcon(app_icon)
 
     screen = QGuiApplication.primaryScreen()
     if screen is not None:
@@ -40,6 +47,7 @@ def main() -> int:
 
     # Initialize components
     overlay = CursorOverlay()
+    virtual_keyboard = VirtualKeyboardWindow()
     input_controller = InputController(
         screen_width=screen_w,
         screen_height=screen_h,
@@ -52,32 +60,89 @@ def main() -> int:
         show_cv_window=False,
     )
 
+    def dispatch_click(button: str, x: float, y: float) -> None:
+        if not virtual_keyboard.handle_virtual_click(button, x, y):
+            input_controller.trigger_click(button, x, y)
+
+    def dispatch_mouse_down(button: str, x: float, y: float) -> None:
+        if not virtual_keyboard.handle_virtual_mouse_down(button, x, y):
+            input_controller.on_mouse_down(button, x, y)
+
+    def dispatch_mouse_up(button: str, x: float, y: float) -> None:
+        if not virtual_keyboard.handle_virtual_mouse_up(button, x, y):
+            input_controller.on_mouse_up(button, x, y)
+
     # Wire Qt Signals & Slots across threads
     tracker.cursor_moved.connect(overlay.update_cursor_position)
+    tracker.cursor_moved.connect(virtual_keyboard.on_virtual_cursor_moved)
     tracker.cursor_moved.connect(input_controller.on_cursor_moved)
     tracker.hand_presence_changed.connect(overlay.on_hand_presence_changed)
     tracker.pinch_state_changed.connect(overlay.on_pinch_state_changed)
-    tracker.mouse_down.connect(input_controller.on_mouse_down)
-    tracker.mouse_up.connect(input_controller.on_mouse_up)
+    tracker.mouse_down.connect(dispatch_mouse_down)
+    tracker.mouse_up.connect(dispatch_mouse_up)
     tracker.click_triggered.connect(overlay.on_click_triggered)
-    tracker.click_triggered.connect(input_controller.trigger_click)
+    tracker.click_triggered.connect(dispatch_click)
     tracker.secondary_action_triggered.connect(input_controller.trigger_secondary_action)
+    input_controller.toggle_virtual_keyboard_requested.connect(virtual_keyboard.toggle_visibility)
 
     shutting_down = False
+    tray_icon: QSystemTrayIcon | None = None
 
     def shutdown() -> None:
         nonlocal shutting_down
         if shutting_down:
             return
         shutting_down = True
+        if tray_icon is not None:
+            tray_icon.hide()
         input_controller.release_all()
         if tracker.isRunning():
             tracker.stop()
+        virtual_keyboard.close()
         overlay.close()
-        main_window.close()
+        main_window.force_close()
         app.quit()
 
-    main_window = MainWindow(tracker=tracker, on_close_callback=shutdown)
+    main_window = MainWindow(
+        tracker=tracker,
+        on_close_callback=shutdown,
+        on_toggle_keyboard=virtual_keyboard.toggle_visibility,
+    )
+
+    # System tray icon & menu for reopening or fully quitting Cam-Glove
+    tray_icon = QSystemTrayIcon(app_icon, app)
+    tray_icon.setToolTip("Cam-Glove — Hand Tracking Control Center")
+
+    tray_menu = QMenu()
+    open_action = QAction("Open Cam-Glove", tray_menu)
+    open_action.triggered.connect(main_window.restore_from_tray)
+    tray_menu.addAction(open_action)
+
+    vk_action = QAction("Open / Hide Virtual Keyboard", tray_menu)
+    vk_action.triggered.connect(virtual_keyboard.toggle_visibility)
+    tray_menu.addAction(vk_action)
+
+    swap_action = QAction("Swap Active Main Hand (F2)", tray_menu)
+    swap_action.triggered.connect(tracker.swap_active_main_hand)
+    tray_menu.addAction(swap_action)
+
+    tray_menu.addSeparator()
+
+    quit_action = QAction("Quit Cam-Glove", tray_menu)
+    quit_action.triggered.connect(shutdown)
+    tray_menu.addAction(quit_action)
+
+    tray_icon.setContextMenu(tray_menu)
+
+    def on_tray_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            main_window.restore_from_tray()
+
+    tray_icon.activated.connect(on_tray_activated)
+    tray_icon.show()
 
     tracker.finished.connect(shutdown)
     app.aboutToQuit.connect(input_controller.release_all)
@@ -90,13 +155,11 @@ def main() -> int:
     sigint_timer.timeout.connect(lambda: None)
     sigint_timer.start()
 
-    # Global hotkeys: ESC to exit, F2 to swap Main Hand (Right <-> Left)
+    # Global hotkey: F2 to swap Main Hand (Right <-> Left)
     kb_listener = None
     if pynput_keyboard is not None:
         def on_press(key) -> None:
-            if key == pynput_keyboard.Key.esc:
-                QTimer.singleShot(0, shutdown)
-            elif key == pynput_keyboard.Key.f2:
+            if key == pynput_keyboard.Key.f2:
                 tracker.swap_active_main_hand()
 
         kb_listener = pynput_keyboard.Listener(on_press=on_press)

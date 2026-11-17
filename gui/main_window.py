@@ -3,8 +3,8 @@ from pathlib import Path
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtCore import QPointF, Qt, Slot
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
 from actions.app_discovery import ProgramPickerDialog, format_exec_label
 from core.tracker import (
     DEFAULT_MAIN_BINDINGS,
+    DEFAULT_ROI_MARGINS,
     DEFAULT_SECONDARY_BINDINGS,
     HandTrackingWorker,
 )
@@ -72,6 +74,202 @@ SECONDARY_ACTION_OPTIONS: List[Tuple[str, str]] = [
 ]
 
 
+def create_app_icon() -> QIcon:
+    """Generate a crisp multi-resolution Cam-Glove icon for the window and Windows System Tray."""
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64):
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        s = float(size)
+        margin = s * 0.06
+        radius = s * 0.24
+
+        # Rounded dark badge background
+        painter.setPen(QPen(QColor(0, 210, 255, 220), max(1.2, s * 0.05)))
+        painter.setBrush(QColor(22, 26, 34, 245))
+        painter.drawRoundedRect(
+            margin,
+            margin,
+            s - 2 * margin,
+            s - 2 * margin,
+            radius,
+            radius,
+        )
+
+        # Stylized hand / cursor ring inside badge
+        cx, cy = s * 0.5, s * 0.54
+        ring_r = s * 0.24
+        painter.setPen(QPen(QColor(0, 230, 255), max(1.5, s * 0.08)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), ring_r, ring_r)
+
+        # Center cursor dot + finger tip accent dots
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(80, 255, 160))
+        dot_r = max(1.5, s * 0.08)
+        painter.drawEllipse(QPointF(cx, cy), dot_r, dot_r)
+
+        painter.setBrush(QColor(0, 210, 255))
+        tip_r = max(1.2, s * 0.055)
+        for fx, fy in ((0.30, 0.26), (0.43, 0.20), (0.57, 0.20), (0.70, 0.26)):
+            painter.drawEllipse(QPointF(s * fx, s * fy), tip_r, tip_r)
+
+        painter.end()
+        icon.addPixmap(pix)
+    return icon
+
+
+class InteractivePreviewLabel(QLabel):
+    """
+    Camera preview label that lets the user drag the orange cursor-to-desktop mapping rectangle
+    (corners, edges, or whole box) directly with the mouse.
+    """
+
+    def __init__(
+        self,
+        tracker: HandTrackingWorker,
+        on_roi_changed: Callable[[], None],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__("Starting camera...", parent)
+        self.tracker = tracker
+        self._on_roi_changed = on_roi_changed
+        self.setMouseTracking(True)
+        self._drag_mode: Optional[str] = None
+        self._drag_start_norm: Tuple[float, float] = (0.0, 0.0)
+        self._drag_start_margins: Tuple[float, float, float, float] = (0.15, 0.15, 0.10, 0.38)
+
+    def _widget_to_norm(self, pos_x: float, pos_y: float) -> Optional[Tuple[float, float]]:
+        pix = self.pixmap()
+        if pix is None or pix.isNull() or pix.width() <= 0 or pix.height() <= 0:
+            return None
+        pw, ph = float(pix.width()), float(pix.height())
+        ox = (self.width() - pw) * 0.5
+        oy = (self.height() - ph) * 0.5
+        nx = (pos_x - ox) / pw
+        ny = (pos_y - oy) / ph
+        return nx, ny
+
+    def _hit_test(self, nx: float, ny: float) -> Optional[str]:
+        x1 = self.tracker.margin_left
+        x2 = 1.0 - self.tracker.margin_right
+        y1 = self.tracker.margin_top
+        y2 = 1.0 - self.tracker.margin_bottom
+        tol = 0.04
+
+        near_l = abs(nx - x1) <= tol and (y1 - tol <= ny <= y2 + tol)
+        near_r = abs(nx - x2) <= tol and (y1 - tol <= ny <= y2 + tol)
+        near_t = abs(ny - y1) <= tol and (x1 - tol <= nx <= x2 + tol)
+        near_b = abs(ny - y2) <= tol and (x1 - tol <= nx <= x2 + tol)
+
+        if near_l and near_t:
+            return "tl"
+        if near_r and near_t:
+            return "tr"
+        if near_l and near_b:
+            return "bl"
+        if near_r and near_b:
+            return "br"
+        if near_l:
+            return "l"
+        if near_r:
+            return "r"
+        if near_t:
+            return "t"
+        if near_b:
+            return "b"
+        if x1 < nx < x2 and y1 < ny < y2:
+            return "move"
+        return None
+
+    def _update_cursor_for_mode(self, mode: Optional[str]) -> None:
+        if mode in ("tl", "br"):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif mode in ("tr", "bl"):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif mode in ("l", "r"):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif mode in ("t", "b"):
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif mode == "move":
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            norm = self._widget_to_norm(event.position().x(), event.position().y())
+            if norm is not None:
+                mode = self._hit_test(*norm)
+                if mode is not None:
+                    self._drag_mode = mode
+                    self._drag_start_norm = norm
+                    self._drag_start_margins = (
+                        self.tracker.margin_left,
+                        self.tracker.margin_right,
+                        self.tracker.margin_top,
+                        self.tracker.margin_bottom,
+                    )
+                    self._update_cursor_for_mode(mode)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        norm = self._widget_to_norm(event.position().x(), event.position().y())
+        if norm is None:
+            return
+        nx, ny = norm
+
+        if self._drag_mode is None:
+            self._update_cursor_for_mode(self._hit_test(nx, ny))
+            return
+
+        sl, sr, st, sb = self._drag_start_margins
+        sx, sy = self._drag_start_norm
+        dx = nx - sx
+        dy = ny - sy
+        min_span = 0.15
+
+        x1, x2 = sl, 1.0 - sr
+        y1, y2 = st, 1.0 - sb
+
+        if self._drag_mode == "move":
+            w_box = x2 - x1
+            h_box = y2 - y1
+            new_x1 = max(0.0, min(1.0 - w_box, x1 + dx))
+            new_y1 = max(0.0, min(1.0 - h_box, y1 + dy))
+            x1, x2 = new_x1, new_x1 + w_box
+            y1, y2 = new_y1, new_y1 + h_box
+        else:
+            if "l" in self._drag_mode:
+                x1 = max(0.0, min(x2 - min_span, x1 + dx))
+            if "r" in self._drag_mode:
+                x2 = min(1.0, max(x1 + min_span, x2 + dx))
+            if "t" in self._drag_mode:
+                y1 = max(0.0, min(y2 - min_span, y1 + dy))
+            if "b" in self._drag_mode:
+                y2 = min(1.0, max(y1 + min_span, y2 + dy))
+
+        self.tracker.set_mapping_margins(x1, 1.0 - x2, y1, 1.0 - y2)
+        self._on_roi_changed()
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_mode is not None:
+            self._drag_mode = None
+            norm = self._widget_to_norm(event.position().x(), event.position().y())
+            if norm is not None:
+                self._update_cursor_for_mode(self._hit_test(*norm))
+            self._on_roi_changed()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class MainWindow(QMainWindow):
     """Main desktop application window with live camera preview and gesture binding controls."""
 
@@ -79,14 +277,18 @@ class MainWindow(QMainWindow):
         self,
         tracker: HandTrackingWorker,
         on_close_callback: Optional[Callable[[], None]] = None,
+        on_toggle_keyboard: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.tracker = tracker
         self._on_close_callback = on_close_callback
+        self._on_toggle_keyboard = on_toggle_keyboard
+        self._allow_close = False
 
         self.setWindowTitle("Cam-Glove — Hand Tracking Control Center")
-        self.resize(1060, 620)
+        self.setWindowIcon(create_app_icon())
+        self.resize(1080, 660)
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -94,10 +296,17 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(14)
 
-        # Left side: Camera Preview
-        preview_group = QGroupBox("Camera Preview (Index 8 = Cursor)", self)
+        # Left side: Camera Preview (interactive orange box)
+        preview_group = QGroupBox(
+            "Camera Preview (Index 8 = Cursor | Drag Orange Box or Corners to Adjust Area)",
+            self,
+        )
         preview_layout = QVBoxLayout(preview_group)
-        self.preview_label = QLabel("Starting camera...", self)
+        self.preview_label = InteractivePreviewLabel(
+            tracker=self.tracker,
+            on_roi_changed=self._on_preview_roi_dragged,
+            parent=self,
+        )
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(580, 460)
         self.preview_label.setStyleSheet("background-color: #181818; color: #cccccc;")
@@ -126,7 +335,58 @@ class MainWindow(QMainWindow):
         self.swap_hand_btn = QPushButton("Swap Active Main Hand (F2)", self)
         self.swap_hand_btn.clicked.connect(self.tracker.swap_active_main_hand)
         hand_form.addRow("", self.swap_hand_btn)
+
+        if self._on_toggle_keyboard is not None:
+            self.vk_btn = QPushButton("⌨ Open / Hide Virtual Keyboard", self)
+            self.vk_btn.clicked.connect(self._on_toggle_keyboard)
+            hand_form.addRow("", self.vk_btn)
+
         controls_layout.addWidget(hand_group)
+
+        # 1b. Cursor Mapping Area (Orange Box) Group
+        roi_group = QGroupBox("Cursor Mapping Area (Orange Box)", self)
+        roi_layout = QVBoxLayout(roi_group)
+        roi_hint = QLabel(
+            "Drag the orange box or its corners on the camera preview, or use sliders:",
+            roi_group,
+        )
+        roi_hint.setWordWrap(True)
+        roi_hint.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        roi_layout.addWidget(roi_hint)
+
+        roi_form = QFormLayout()
+        self.roi_sliders: Dict[str, QSlider] = {}
+        self.roi_value_labels: Dict[str, QLabel] = {}
+        for edge_key, edge_label in (
+            ("left", "Left Margin:"),
+            ("right", "Right Margin:"),
+            ("top", "Top Margin:"),
+            ("bottom", "Bottom Margin:"),
+        ):
+            row_w = QWidget(roi_group)
+            row_h = QHBoxLayout(row_w)
+            row_h.setContentsMargins(0, 0, 0, 0)
+            row_h.setSpacing(8)
+
+            slider = QSlider(Qt.Orientation.Horizontal, row_w)
+            slider.setRange(0, 75)
+            val_lbl = QLabel("15%", row_w)
+            val_lbl.setFixedWidth(36)
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            slider.valueChanged.connect(self._on_roi_slider_changed)
+            self.roi_sliders[edge_key] = slider
+            self.roi_value_labels[edge_key] = val_lbl
+
+            row_h.addWidget(slider, stretch=1)
+            row_h.addWidget(val_lbl)
+            roi_form.addRow(edge_label, row_w)
+
+        roi_layout.addLayout(roi_form)
+        self.reset_roi_btn = QPushButton("Reset Orange Area", roi_group)
+        self.reset_roi_btn.clicked.connect(self._reset_roi_margins)
+        roi_layout.addWidget(self.reset_roi_btn)
+        controls_layout.addWidget(roi_group)
 
         # 2. Main Hand Gesture Bindings
         main_gestures_group = QGroupBox("Main Hand Gestures", self)
@@ -274,6 +534,7 @@ class MainWindow(QMainWindow):
 
     def _sync_ui_from_tracker(self) -> None:
         self._sync_main_hand_combo(self.tracker.preferred_main_hand)
+        self._sync_roi_sliders_from_tracker()
         for g_key, combo in self.main_combos.items():
             act = self.tracker.main_bindings.get(g_key, DEFAULT_MAIN_BINDINGS[g_key])
             combo.blockSignals(True)
@@ -302,6 +563,42 @@ class MainWindow(QMainWindow):
     def _on_main_hand_combo_changed(self) -> None:
         hand = str(self.main_hand_combo.currentData())
         self.tracker.set_preferred_main_hand(hand)
+        self._save_settings()
+
+    def _sync_roi_sliders_from_tracker(self) -> None:
+        mapping = {
+            "left": self.tracker.margin_left,
+            "right": self.tracker.margin_right,
+            "top": self.tracker.margin_top,
+            "bottom": self.tracker.margin_bottom,
+        }
+        for key, val in mapping.items():
+            pct = int(round(val * 100))
+            slider = self.roi_sliders.get(key)
+            lbl = self.roi_value_labels.get(key)
+            if slider is not None:
+                slider.blockSignals(True)
+                slider.setValue(pct)
+                slider.blockSignals(False)
+            if lbl is not None:
+                lbl.setText(f"{pct}%")
+
+    def _on_preview_roi_dragged(self) -> None:
+        self._sync_roi_sliders_from_tracker()
+        self._save_settings()
+
+    def _on_roi_slider_changed(self) -> None:
+        left = self.roi_sliders["left"].value() / 100.0
+        right = self.roi_sliders["right"].value() / 100.0
+        top = self.roi_sliders["top"].value() / 100.0
+        bottom = self.roi_sliders["bottom"].value() / 100.0
+        self.tracker.set_mapping_margins(left, right, top, bottom)
+        self._sync_roi_sliders_from_tracker()
+        self._save_settings()
+
+    def _reset_roi_margins(self) -> None:
+        self.tracker.reset_mapping_margins()
+        self._sync_roi_sliders_from_tracker()
         self._save_settings()
 
     def _on_binding_combo_changed(
@@ -358,6 +655,14 @@ class MainWindow(QMainWindow):
                 for k, v in data["secondary_bindings"].items():
                     if isinstance(k, str) and isinstance(v, str):
                         self.tracker.secondary_bindings[k] = v
+            if isinstance(data.get("roi_margins"), dict):
+                rm = data["roi_margins"]
+                self.tracker.set_mapping_margins(
+                    float(rm.get("left", DEFAULT_ROI_MARGINS["left"])),
+                    float(rm.get("right", DEFAULT_ROI_MARGINS["right"])),
+                    float(rm.get("top", DEFAULT_ROI_MARGINS["top"])),
+                    float(rm.get("bottom", DEFAULT_ROI_MARGINS["bottom"])),
+                )
         except Exception:
             pass
 
@@ -367,6 +672,12 @@ class MainWindow(QMainWindow):
             "main_bindings": self.tracker.main_bindings,
             "secondary_bindings": self.tracker.secondary_bindings,
             "custom_gestures": self.tracker.custom_gestures,
+            "roi_margins": {
+                "left": round(self.tracker.margin_left, 4),
+                "right": round(self.tracker.margin_right, 4),
+                "top": round(self.tracker.margin_top, 4),
+                "bottom": round(self.tracker.margin_bottom, 4),
+            },
         }
         try:
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -375,6 +686,8 @@ class MainWindow(QMainWindow):
 
     @Slot(QImage)
     def update_preview_frame(self, q_img: QImage) -> None:
+        if not self.isVisible():
+            return
         pixmap = QPixmap.fromImage(q_img)
         scaled = pixmap.scaled(
             self.preview_label.size(),
@@ -383,7 +696,22 @@ class MainWindow(QMainWindow):
         )
         self.preview_label.setPixmap(scaled)
 
+    def restore_from_tray(self) -> None:
+        """Show and bring the control center window to the foreground from the system tray."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def force_close(self) -> None:
+        """Allow the window to close completely during full application shutdown."""
+        self._allow_close = True
+        self.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if not self._allow_close:
+            event.ignore()
+            self.hide()
+            return
         if self._on_close_callback is not None:
             self._on_close_callback()
         super().closeEvent(event)

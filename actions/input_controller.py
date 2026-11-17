@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 from typing import Optional
-from PySide6.QtCore import QObject, Slot
+from PySide6.QtCore import QObject, Signal, Slot
 
 try:
     from pynput.keyboard import Controller as PynputKeyboardController, Key
@@ -36,6 +36,8 @@ VK_V = 0x56
 
 class InputController(QObject):
     """Dispatches LMB/MMB click-and-hold and LMB/RMB clicks without hijacking the OS cursor when idle."""
+
+    toggle_virtual_keyboard_requested = Signal()
 
     def __init__(
         self,
@@ -204,19 +206,8 @@ class InputController(QObject):
                     self._pynput_kb.tap("d")
 
     def _open_virtual_keyboard(self) -> None:
-        """Toggle Windows On-Screen Keyboard via native Win+Ctrl+O shortcut (avoids UAC/Wow64 issues)."""
-        if self._is_windows:
-            user32 = ctypes.windll.user32
-            user32.keybd_event(VK_LWIN, 0, 0, 0)
-            user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            user32.keybd_event(VK_O, 0, 0, 0)
-            user32.keybd_event(VK_O, 0, KEYEVENTF_KEYUP, 0)
-            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            user32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
-        elif self._pynput_kb is not None and Key is not None:
-            with self._pynput_kb.pressed(Key.cmd):
-                with self._pynput_kb.pressed(Key.ctrl):
-                    self._pynput_kb.tap("o")
+        """Toggle the built-in Cam-Glove Virtual Keyboard (clickable by hand without UIPI blocking)."""
+        self.toggle_virtual_keyboard_requested.emit()
 
     def _launch_target(self, target_path: str) -> None:
         """Launch a user-specified executable, Start Menu shortcut (.lnk), or file."""
@@ -256,8 +247,8 @@ class InputController(QObject):
             down_flag = MOUSEEVENTF_RIGHTDOWN
             up_flag = MOUSEEVENTF_RIGHTUP
 
-        flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | down_flag | up_flag
-        user32.mouse_event(flags, abs_x, abs_y, 0, 0)
+        user32.mouse_event(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | down_flag, abs_x, abs_y, 0, 0)
+        user32.mouse_event(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | up_flag, abs_x, abs_y, 0, 0)
 
         if self.restore_cursor:
             user32.SetCursorPos(prev_pt.x, prev_pt.y)

@@ -6,6 +6,9 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.request
 
+if hasattr(sys, "set_lazy_imports_filter"):
+    sys.set_lazy_imports_filter(lambda *_: False)
+
 # Suppress verbose MediaPipe / TensorFlow Lite C++ logs
 os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -65,6 +68,13 @@ DEFAULT_SECONDARY_BINDINGS: Dict[str, str] = {
     "three_fingers": "show_desktop",
 }
 
+DEFAULT_ROI_MARGINS: Dict[str, float] = {
+    "left": 0.15,
+    "right": 0.15,
+    "top": 0.10,
+    "bottom": 0.38,
+}
+
 
 def ensure_model(model_path: Path = MODEL_PATH) -> Path:
     if not model_path.exists():
@@ -82,6 +92,75 @@ def _clamp(val: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 def _norm_dist(lm1, lm2) -> float:
     return math.hypot(lm1.x - lm2.x, lm1.y - lm2.y)
+
+
+def _are_same_physical_hand(h0, h1) -> bool:
+    """
+    Return True if two MediaPipe landmark sets represent duplicate detections on the same physical hand.
+    Checks palm/wrist/finger proximity scaled by hand size as well as bounding-box overlap.
+    """
+    hand_size = max(
+        _norm_dist(h0[WRIST], h0[MIDDLE_TIP]),
+        _norm_dist(h1[WRIST], h1[MIDDLE_TIP]),
+        0.12,
+    )
+
+    # 1. Wrist proximity
+    if _norm_dist(h0[WRIST], h1[WRIST]) < max(0.10, 0.42 * hand_size):
+        return True
+
+    # 2. Palm center proximity (WRIST=0, INDEX_MCP=5, MIDDLE_MCP=9, RING_MCP=13, PINKY_MCP=17)
+    palm_indices = (0, 5, 9, 13, 17)
+    p0_x = sum(h0[i].x for i in palm_indices) / len(palm_indices)
+    p0_y = sum(h0[i].y for i in palm_indices) / len(palm_indices)
+    p1_x = sum(h1[i].x for i in palm_indices) / len(palm_indices)
+    p1_y = sum(h1[i].y for i in palm_indices) / len(palm_indices)
+    if math.hypot(p0_x - p1_x, p0_y - p1_y) < max(0.10, 0.45 * hand_size):
+        return True
+
+    # 3. Four-finger knuckle + tip alignment (catches duplicate skeleton with flipped thumb)
+    finger_indices = (5, 8, 9, 12, 13, 16, 17, 20)
+    avg_finger_dist = sum(_norm_dist(h0[i], h1[i]) for i in finger_indices) / len(finger_indices)
+    if avg_finger_dist < max(0.09, 0.35 * hand_size):
+        return True
+
+    # 4. Bounding-box intersection over smaller box area
+    xs0 = [lm.x for lm in h0]
+    ys0 = [lm.y for lm in h0]
+    xs1 = [lm.x for lm in h1]
+    ys1 = [lm.y for lm in h1]
+    x_left = max(min(xs0), min(xs1))
+    y_top = max(min(ys0), min(ys1))
+    x_right = min(max(xs0), max(xs1))
+    y_bottom = min(max(ys0), max(ys1))
+    if x_right > x_left and y_bottom > y_top:
+        inter_area = (x_right - x_left) * (y_bottom - y_top)
+        area0 = max(1e-6, (max(xs0) - min(xs0)) * (max(ys0) - min(ys0)))
+        area1 = max(1e-6, (max(xs1) - min(xs1)) * (max(ys1) - min(ys1)))
+        if inter_area / min(area0, area1) > 0.55:
+            return True
+
+    return False
+
+
+def _select_better_single_hand(h0, h1, handedness_list=None):
+    """When h0 and h1 are duplicates on one physical hand, pick the better-formed skeleton."""
+    # A duplicate ghost hand on the same physical hand collapses the thumb onto the pinky side.
+    spread0 = _norm_dist(h0[THUMB_TIP], h0[PINKY_MCP])
+    spread1 = _norm_dist(h1[THUMB_TIP], h1[PINKY_MCP])
+    if spread1 > spread0 * 1.15:
+        return h1
+    if spread0 > spread1 * 1.15:
+        return h0
+    if handedness_list and len(handedness_list) >= 2:
+        try:
+            score0 = float(handedness_list[0][0].score)
+            score1 = float(handedness_list[1][0].score)
+            if score1 > score0:
+                return h1
+        except Exception:
+            pass
+    return h0
 
 
 def _format_action_banner(action: str) -> str:
@@ -271,6 +350,8 @@ class HandTrackingWorker(QThread):
         self.mmb_pinch_threshold = mmb_pinch_threshold
         self.mmb_release_threshold = mmb_release_threshold
         self.margin_x = margin_x
+        self.margin_left = margin_x
+        self.margin_right = margin_x
         self.margin_top = margin_top
         self.margin_bottom = margin_bottom
         self.preferred_main_hand = (
@@ -342,6 +423,36 @@ class HandTrackingWorker(QThread):
         self.custom_gestures = [g for g in self.custom_gestures if g.get("id") != gesture_id]
         self.secondary_bindings.pop(gesture_id, None)
 
+    def set_mapping_margins(
+        self,
+        left: float,
+        right: float,
+        top: float,
+        bottom: float,
+    ) -> None:
+        """Update the webcam-to-desktop cursor mapping rectangle margins (normalized 0..1)."""
+        left = _clamp(left, 0.0, 0.80)
+        right = _clamp(right, 0.0, 0.80)
+        top = _clamp(top, 0.0, 0.80)
+        bottom = _clamp(bottom, 0.0, 0.80)
+        if left + right > 0.88:
+            right = max(0.0, 0.88 - left)
+        if top + bottom > 0.88:
+            bottom = max(0.0, 0.88 - top)
+        self.margin_left = left
+        self.margin_right = right
+        self.margin_top = top
+        self.margin_bottom = bottom
+        self.margin_x = 0.5 * (left + right)
+
+    def reset_mapping_margins(self) -> None:
+        self.set_mapping_margins(
+            DEFAULT_ROI_MARGINS["left"],
+            DEFAULT_ROI_MARGINS["right"],
+            DEFAULT_ROI_MARGINS["top"],
+            DEFAULT_ROI_MARGINS["bottom"],
+        )
+
     def reset_default_bindings(self) -> None:
         self.main_bindings = dict(DEFAULT_MAIN_BINDINGS)
         for k, v in DEFAULT_SECONDARY_BINDINGS.items():
@@ -350,6 +461,7 @@ class HandTrackingWorker(QThread):
             gid = str(cg.get("id", ""))
             if gid and gid not in self.secondary_bindings:
                 self.secondary_bindings[gid] = "none"
+        self.reset_mapping_margins()
 
     def _activate_action(self, action: str, x: float, y: float) -> None:
         if action == "left_click":
@@ -465,7 +577,17 @@ class HandTrackingWorker(QThread):
                             self._hand_present = True
                             self.hand_presence_changed.emit(True)
 
-                        hands_list = results.hand_landmarks
+                        hands_list = list(results.hand_landmarks)
+                        if len(hands_list) >= 2 and _are_same_physical_hand(
+                            hands_list[0], hands_list[1]
+                        ):
+                            hands_list = [
+                                _select_better_single_hand(
+                                    hands_list[0],
+                                    hands_list[1],
+                                    getattr(results, "handedness", None),
+                                )
+                            ]
                         secondary_lms = None
 
                         if len(hands_list) == 1:
@@ -510,9 +632,9 @@ class HandTrackingWorker(QThread):
                         pinky_tip = hand_lms[PINKY_TIP]
 
                         # 1. Index fingertip (landmark 8) -> smoothed cursor coordinates
-                        span_x = max(1e-5, 1.0 - 2.0 * self.margin_x)
+                        span_x = max(1e-5, 1.0 - self.margin_left - self.margin_right)
                         span_y = max(1e-5, 1.0 - self.margin_top - self.margin_bottom)
-                        norm_x = _clamp((index_tip.x - self.margin_x) / span_x)
+                        norm_x = _clamp((index_tip.x - self.margin_left) / span_x)
                         norm_y = _clamp((index_tip.y - self.margin_top) / span_y)
 
                         raw_x = norm_x * self.screen_width
@@ -655,12 +777,14 @@ class HandTrackingWorker(QThread):
                             if lost_hand_frames > 10:
                                 self._release_all_gestures()
 
-                    # Draw active screen mapping zone and HUD text on preview frame
-                    box_x1 = int(self.margin_x * w)
+                    # Draw active screen mapping zone (orange box + corner handles) and HUD text
+                    box_x1 = int(self.margin_left * w)
                     box_y1 = int(self.margin_top * h)
-                    box_x2 = int((1.0 - self.margin_x) * w)
+                    box_x2 = int((1.0 - self.margin_right) * w)
                     box_y2 = int((1.0 - self.margin_bottom) * h)
-                    cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (100, 220, 255), 1)
+                    cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (40, 175, 255), 2)
+                    for cx, cy in ((box_x1, box_y1), (box_x2, box_y1), (box_x1, box_y2), (box_x2, box_y2)):
+                        cv2.rectangle(frame, (cx - 5, cy - 5), (cx + 5, cy + 5), (40, 175, 255), cv2.FILLED)
 
                     cv2.putText(
                         frame,
