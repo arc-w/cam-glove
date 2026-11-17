@@ -14,6 +14,7 @@ from core.tracker import HandTrackingWorker
 from gui.main_window import MainWindow, create_app_icon
 from gui.overlay import CursorOverlay
 from gui.virtual_keyboard import VirtualKeyboardWindow
+from gui.webcam_overlay import WebcamOverlayWindow
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -48,6 +49,7 @@ def main() -> int:
     # Initialize components
     overlay = CursorOverlay()
     virtual_keyboard = VirtualKeyboardWindow()
+    webcam_overlay = WebcamOverlayWindow()
     input_controller = InputController(
         screen_width=screen_w,
         screen_height=screen_h,
@@ -61,21 +63,32 @@ def main() -> int:
     )
 
     def dispatch_click(button: str, x: float, y: float) -> None:
-        if not virtual_keyboard.handle_virtual_click(button, x, y):
-            input_controller.trigger_click(button, x, y)
+        if virtual_keyboard.handle_virtual_click(button, x, y):
+            return
+        if webcam_overlay.handle_virtual_click(button, x, y):
+            return
+        input_controller.trigger_click(button, x, y)
 
     def dispatch_mouse_down(button: str, x: float, y: float) -> None:
-        if not virtual_keyboard.handle_virtual_mouse_down(button, x, y):
-            input_controller.on_mouse_down(button, x, y)
+        if virtual_keyboard.handle_virtual_mouse_down(button, x, y):
+            return
+        if webcam_overlay.handle_virtual_mouse_down(button, x, y):
+            return
+        input_controller.on_mouse_down(button, x, y)
 
     def dispatch_mouse_up(button: str, x: float, y: float) -> None:
-        if not virtual_keyboard.handle_virtual_mouse_up(button, x, y):
-            input_controller.on_mouse_up(button, x, y)
+        if virtual_keyboard.handle_virtual_mouse_up(button, x, y):
+            return
+        if webcam_overlay.handle_virtual_mouse_up(button, x, y):
+            return
+        input_controller.on_mouse_up(button, x, y)
 
     # Wire Qt Signals & Slots across threads
     tracker.cursor_moved.connect(overlay.update_cursor_position)
     tracker.cursor_moved.connect(virtual_keyboard.on_virtual_cursor_moved)
+    tracker.cursor_moved.connect(webcam_overlay.on_virtual_cursor_moved)
     tracker.cursor_moved.connect(input_controller.on_cursor_moved)
+    tracker.frame_ready.connect(webcam_overlay.update_preview_frame)
     tracker.hand_presence_changed.connect(overlay.on_hand_presence_changed)
     tracker.pinch_state_changed.connect(overlay.on_pinch_state_changed)
     tracker.mouse_down.connect(dispatch_mouse_down)
@@ -84,6 +97,7 @@ def main() -> int:
     tracker.click_triggered.connect(dispatch_click)
     tracker.secondary_action_triggered.connect(input_controller.trigger_secondary_action)
     input_controller.toggle_virtual_keyboard_requested.connect(virtual_keyboard.toggle_visibility)
+    input_controller.toggle_webcam_overlay_requested.connect(webcam_overlay.toggle_visibility)
 
     shutting_down = False
     tray_icon: QSystemTrayIcon | None = None
@@ -98,15 +112,23 @@ def main() -> int:
         input_controller.release_all()
         if tracker.isRunning():
             tracker.stop()
+        webcam_overlay.close()
         virtual_keyboard.close()
         overlay.close()
         main_window.force_close()
         app.quit()
 
+    def sync_preview_enabled(*_args) -> None:
+        tracker.set_preview_enabled(main_window.isVisible() or webcam_overlay.isVisible())
+
+    webcam_overlay._on_visibility_changed = sync_preview_enabled
+
     main_window = MainWindow(
         tracker=tracker,
         on_close_callback=shutdown,
         on_toggle_keyboard=virtual_keyboard.toggle_visibility,
+        on_toggle_webcam_overlay=webcam_overlay.toggle_visibility,
+        on_visibility_changed=sync_preview_enabled,
     )
 
     # System tray icon & menu for reopening, pausing, or fully quitting Cam-Glove
@@ -121,6 +143,10 @@ def main() -> int:
     pause_action = QAction("Pause Tracking (F4)", tray_menu)
     pause_action.triggered.connect(tracker.toggle_paused)
     tray_menu.addAction(pause_action)
+
+    cam_overlay_action = QAction("Open / Hide Floating Webcam", tray_menu)
+    cam_overlay_action.triggered.connect(webcam_overlay.toggle_visibility)
+    tray_menu.addAction(cam_overlay_action)
 
     vk_action = QAction("Open / Hide Virtual Keyboard", tray_menu)
     vk_action.triggered.connect(virtual_keyboard.toggle_visibility)
@@ -148,6 +174,22 @@ def main() -> int:
             tray_icon.setToolTip("Cam-Glove — Hand Tracking Control Center (Active)")
 
     tracker.tracking_paused_changed.connect(on_paused_changed)
+
+    def on_hand_activated(hand_role: str) -> None:
+        if tray_icon is not None and tray_icon.isVisible():
+            delay_s = tracker.activation_delay
+            if delay_s > 0.0:
+                msg = f"{hand_role} unlocked via Peace Sign ✌ — commands start in {delay_s:.1f}s."
+            else:
+                msg = f"{hand_role} unlocked via Peace Sign ✌ and ready!"
+            tray_icon.showMessage(
+                f"Cam-Glove — {hand_role} Activated",
+                msg,
+                app_icon,
+                2200,
+            )
+
+    tracker.hand_activated.connect(on_hand_activated)
 
     def on_tray_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (

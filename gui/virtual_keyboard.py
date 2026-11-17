@@ -20,6 +20,14 @@ WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 
+HWND_TOPMOST = ctypes.wintypes.HWND(-1)
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+SWP_NOOWNERZORDER = 0x0200
+SWP_NOSENDCHANGING = 0x0400
+
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -228,6 +236,7 @@ class VirtualKeyboardWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.BypassWindowManagerHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -243,7 +252,16 @@ class VirtualKeyboardWindow(QWidget):
         self._btn_to_key_id: Dict[QPushButton, str] = {}
         self._opacity_levels = [0.96, 0.78, 0.60]
         self._opacity_idx = 0
+        self._docked_top = False
+        self._auto_shifted_for_start_menu = False
+        self._saved_bottom_pos: Optional[QPoint] = None
         self.setWindowOpacity(self._opacity_levels[0])
+
+        # Periodic HWND_TOPMOST re-assertion + Start Menu overlap avoidance
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.setInterval(80)
+        self._topmost_timer.timeout.connect(self._on_topmost_tick)
+        self._topmost_timer.start()
 
         # Key auto-repeat timer when holding pinch on Backspace / Space / Arrow keys
         self._held_key_id: Optional[str] = None
@@ -297,6 +315,15 @@ class VirtualKeyboardWindow(QWidget):
             btn.clicked.connect(lambda _checked=False, k=key_id: self._on_key_clicked(k))
             header.addWidget(btn)
 
+        self.dock_btn = QPushButton("⬆ Top", self)
+        self.dock_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.dock_btn.setFixedHeight(28)
+        self.dock_btn.setMinimumWidth(62)
+        self.dock_btn.setProperty("role", "header_btn")
+        self.dock_btn.setToolTip("Dock virtual keyboard to top or bottom of screen")
+        self.dock_btn.clicked.connect(self._toggle_dock_position)
+        header.addWidget(self.dock_btn)
+
         self.opacity_btn = QPushButton("◐ 95%", self)
         self.opacity_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.opacity_btn.setFixedHeight(28)
@@ -331,6 +358,29 @@ class VirtualKeyboardWindow(QWidget):
                 btn.clicked.connect(lambda _checked=False, k=norm_id: self._on_key_clicked(k))
                 row_layout.addWidget(btn, stretch=stretch)
             root.addLayout(row_layout)
+
+    def _position_top_center(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = avail.x() + (avail.width() - self.width()) // 2
+            y = avail.y() + 14
+            self.move(max(0, x), max(0, y))
+
+    def _toggle_dock_position(self) -> None:
+        self._docked_top = not self._docked_top
+        if self._docked_top:
+            self._position_top_center()
+            self.dock_btn.setText("⬇ Bot")
+        else:
+            self._position_bottom_center()
+            self.dock_btn.setText("⬆ Top")
+        self._apply_win32_noactivate()
+
+    def _on_topmost_tick(self) -> None:
+        if not self.isVisible():
+            return
+        self._apply_win32_noactivate()
 
     def _cycle_opacity(self) -> None:
         self._opacity_idx = (self._opacity_idx + 1) % len(self._opacity_levels)
@@ -420,10 +470,17 @@ class VirtualKeyboardWindow(QWidget):
             return
         user32 = ctypes.windll.user32
         ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        user32.SetWindowLongW(
-            hwnd,
-            GWL_EXSTYLE,
-            ex_style | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        target_style = ex_style | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+        if ex_style != target_style:
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, target_style)
+        user32.SetWindowPos(
+            ctypes.wintypes.HWND(hwnd),
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
         )
 
     def toggle_visibility(self) -> None:

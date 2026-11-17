@@ -81,6 +81,7 @@ DEFAULT_ROI_MARGINS: Dict[str, float] = {
 }
 
 SECONDARY_HOLD_FRAMES = 7
+SAFE_UNLOCK_HOLD_FRAMES = 6
 
 
 def ensure_model(model_path: Path = MODEL_PATH) -> Path:
@@ -226,12 +227,32 @@ def _draw_hand(
     hold_pinched: bool = False,
     mmb_pinched: bool = False,
     stabilized: bool = False,
+    locked: bool = False,
+    unlock_progress: float = 0.0,
 ) -> None:
     pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms]
+    bone_color = (120, 140, 175) if locked else (200, 200, 200)
+    joint_color = (80, 140, 255) if locked else (255, 100, 0)
     for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (200, 200, 200), 2)
+        cv2.line(frame, pts[a], pts[b], bone_color, 2)
     for pt in pts:
-        cv2.circle(frame, pt, 4, (255, 100, 0), cv2.FILLED)
+        cv2.circle(frame, pt, 4, joint_color, cv2.FILLED)
+
+    if locked:
+        wx, wy = pts[WRIST]
+        if 0.05 < unlock_progress < 1.0:
+            end_angle = int(360 * _clamp(unlock_progress, 0.0, 1.0))
+            cv2.ellipse(
+                frame,
+                (wx, wy),
+                (18, 18),
+                -90,
+                0,
+                end_angle,
+                (0, 220, 255),
+                3,
+            )
+        return
 
     # Highlight base knuckle of ring finger (RING_MCP = 13) for MMB / wheel press
     cv2.circle(frame, pts[RING_MCP], 6, (255, 220, 120), 2)
@@ -343,6 +364,17 @@ def _get_finger_states(hand_lms) -> Dict[str, bool]:
     }
 
 
+def _is_peace_sign(hand_lms) -> bool:
+    """Return True if the hand is showing a Peace Sign (Index + Middle extended, Ring + Pinky curled)."""
+    f_states = _get_finger_states(hand_lms)
+    return (
+        f_states["index"]
+        and f_states["middle"]
+        and not f_states["ring"]
+        and not f_states["pinky"]
+    )
+
+
 def _detect_secondary_gesture(
     hand_lms,
     custom_gestures: List[Dict[str, Any]],
@@ -412,6 +444,7 @@ class HandTrackingWorker(QThread):
     main_hand_changed = Signal(str)
     tracking_paused_changed = Signal(bool)
     fps_updated = Signal(float)
+    hand_activated = Signal(str)
 
     def __init__(
         self,
@@ -453,6 +486,8 @@ class HandTrackingWorker(QThread):
         self.smoothing_level: int = 50
         self.pinch_sensitivity: int = 100
         self.pinch_stabilization: bool = True
+        self.safe_hand_detection: bool = False
+        self.activation_delay: float = 2.0
         self.preview_enabled: bool = True
         self.paused: bool = False
 
@@ -479,9 +514,16 @@ class HandTrackingWorker(QThread):
         self._last_smooth_y = screen_height / 2.0
         self._last_click_anchor_time = 0.0
 
-        # Multi-hand tracking state
+        # Multi-hand & safe-unlock tracking state
         self._main_wrist_pos: Optional[tuple[float, float]] = None
         self._swap_requested = False
+        self._main_hand_unlocked: bool = False
+        self._main_unlock_frames: int = 0
+        self._main_activated_time: float = 0.0
+        self._sec_hand_unlocked: bool = False
+        self._sec_unlock_frames: int = 0
+        self._sec_activated_time: float = 0.0
+        self._sec_lost_frames: int = 0
         self._sec_candidate_gesture: Optional[str] = None
         self._sec_hold_frames = 0
         self._sec_neutral_frames = 0
@@ -489,10 +531,34 @@ class HandTrackingWorker(QThread):
         self._last_sec_banner = ""
         self._last_sec_banner_time = 0.0
 
+    def set_safe_hand_detection(self, enabled: bool) -> None:
+        new_val = bool(enabled)
+        if self.safe_hand_detection != new_val:
+            self.safe_hand_detection = new_val
+            if new_val:
+                self._main_hand_unlocked = False
+                self._main_unlock_frames = 0
+                self._main_activated_time = 0.0
+                self._sec_hand_unlocked = False
+                self._sec_unlock_frames = 0
+                self._sec_activated_time = 0.0
+                self._release_all_gestures()
+                if self._hand_present:
+                    self._hand_present = False
+                    self.hand_presence_changed.emit(False)
+
+    def set_activation_delay(self, seconds: float) -> None:
+        """Set post-activation grace period (0.0s .. 10.0s) before gesture commands execute."""
+        self.activation_delay = _clamp(float(seconds), 0.0, 10.0)
+
     def set_paused(self, paused: bool) -> None:
         if self.paused != paused:
             self.paused = paused
             if paused:
+                self._main_hand_unlocked = False
+                self._main_unlock_frames = 0
+                self._sec_hand_unlocked = False
+                self._sec_unlock_frames = 0
                 self._release_all_gestures()
                 if self._hand_present:
                     self._hand_present = False
@@ -764,9 +830,6 @@ class HandTrackingWorker(QThread):
                     results = landmarker.detect_for_video(mp_image, ts_ms)
                     if results.hand_landmarks:
                         lost_hand_frames = 0
-                        if not self._hand_present:
-                            self._hand_present = True
-                            self.hand_presence_changed.emit(True)
 
                         hands_list = list(results.hand_landmarks)
                         if len(hands_list) >= 2 and _are_same_physical_hand(
@@ -788,12 +851,34 @@ class HandTrackingWorker(QThread):
                             self._sec_candidate_gesture = None
                             self._sec_hold_frames = 0
                             self._sec_latched_gesture = None
+                            self._sec_lost_frames += 1
+                            if self._sec_lost_frames > 10:
+                                self._sec_hand_unlocked = False
+                                self._sec_unlock_frames = 0
                         else:
+                            self._sec_lost_frames = 0
                             h0, h1 = hands_list[0], hands_list[1]
                             w0 = (h0[WRIST].x, h0[WRIST].y)
                             w1 = (h1[WRIST].x, h1[WRIST].y)
 
-                            if self._main_wrist_pos is not None:
+                            # When Safe Hand Detection is on and neither hand is unlocked yet,
+                            # the first hand to show the Peace Sign becomes the Main Hand.
+                            if self.safe_hand_detection and not self._main_hand_unlocked:
+                                p0 = _is_peace_sign(h0)
+                                p1 = _is_peace_sign(h1)
+                                if p0 and not p1:
+                                    main_is_0 = True
+                                    self._swap_requested = False
+                                elif p1 and not p0:
+                                    main_is_0 = False
+                                    self._swap_requested = False
+                                elif self._main_wrist_pos is not None:
+                                    d0 = math.hypot(w0[0] - self._main_wrist_pos[0], w0[1] - self._main_wrist_pos[1])
+                                    d1 = math.hypot(w1[0] - self._main_wrist_pos[0], w1[1] - self._main_wrist_pos[1])
+                                    main_is_0 = d0 <= d1
+                                else:
+                                    main_is_0 = (w0[0] >= w1[0]) if self.preferred_main_hand == "Right" else (w0[0] < w1[0])
+                            elif self._main_wrist_pos is not None:
                                 d0 = math.hypot(w0[0] - self._main_wrist_pos[0], w0[1] - self._main_wrist_pos[1])
                                 d1 = math.hypot(w1[0] - self._main_wrist_pos[0], w1[1] - self._main_wrist_pos[1])
                                 if self._swap_requested:
@@ -815,6 +900,37 @@ class HandTrackingWorker(QThread):
 
                             self._main_wrist_pos = (hand_lms[WRIST].x, hand_lms[WRIST].y)
 
+                        # Safe Hand Detection: require Peace Sign (Index + Middle extended) to unlock Main Hand
+                        main_unlock_progress = 1.0
+                        main_warmup_remaining = 0.0
+                        if not self.safe_hand_detection:
+                            main_active = True
+                            main_commands_ready = True
+                        else:
+                            if not self._main_hand_unlocked:
+                                if _is_peace_sign(hand_lms):
+                                    self._main_unlock_frames += 1
+                                    if self._main_unlock_frames >= SAFE_UNLOCK_HOLD_FRAMES:
+                                        self._main_hand_unlocked = True
+                                        self._main_unlock_frames = 0
+                                        self._main_activated_time = now
+                                        self._last_sec_banner = "MAIN HAND: ACTIVATED"
+                                        self._last_sec_banner_time = now
+                                        self.hand_activated.emit("Main Hand")
+                                else:
+                                    self._main_unlock_frames = 0
+                            main_active = self._main_hand_unlocked
+                            if not main_active:
+                                main_unlock_progress = min(
+                                    1.0, self._main_unlock_frames / float(SAFE_UNLOCK_HOLD_FRAMES)
+                                )
+                                main_commands_ready = False
+                            else:
+                                main_warmup_remaining = max(
+                                    0.0, self.activation_delay - (now - self._main_activated_time)
+                                )
+                                main_commands_ready = main_warmup_remaining <= 0.0
+
                         thumb_tip = hand_lms[THUMB_TIP]
                         index_tip = hand_lms[INDEX_TIP]
                         middle_tip = hand_lms[MIDDLE_TIP]
@@ -830,139 +946,205 @@ class HandTrackingWorker(QThread):
                         eff_mmb_pinch = self.mmb_pinch_threshold * hand_scale * sens_mult
                         eff_mmb_release = self.mmb_release_threshold * hand_scale * sens_mult
 
-                        # Compute distances for Main Hand gestures
-                        d_mid = _norm_dist(thumb_tip, middle_tip)
-                        d_ring = _norm_dist(thumb_tip, ring_tip)
-                        d_pinky = _norm_dist(thumb_tip, pinky_tip)
-                        d_ring_mcp = _norm_dist(thumb_tip, ring_mcp)
-
-                        # Pre-Pinch Cursor Stabilization ("Pinch Anchor"):
-                        # Dampen involuntary index fingertip pull when middle/ring/pinky close toward thumb
-                        damping_scale = 1.0
                         is_stabilized = False
-                        if self.pinch_stabilization:
-                            active_vals_now = set(self._gesture_active_action.values())
-                            is_dragging = "hold_lmb" in active_vals_now or "hold_mmb" in active_vals_now
-                            min_click_dist = min(d_mid, d_ring)
-                            if now - self._last_click_anchor_time < 0.11 and not is_dragging:
-                                damping_scale = 0.08
-                                is_stabilized = True
-                            elif min_click_dist < eff_pinch * 1.60 and not is_dragging:
-                                ratio = _clamp(
-                                    (min_click_dist - eff_pinch * 0.85) / (eff_pinch * 0.75),
-                                    0.0,
-                                    1.0,
+                        smooth_x, smooth_y = self._last_smooth_x, self._last_smooth_y
+
+                        if main_active:
+                            if not self._hand_present:
+                                self._hand_present = True
+                                self.hand_presence_changed.emit(True)
+
+                            # Compute distances for Main Hand gestures
+                            d_mid = _norm_dist(thumb_tip, middle_tip)
+                            d_ring = _norm_dist(thumb_tip, ring_tip)
+                            d_pinky = _norm_dist(thumb_tip, pinky_tip)
+                            d_ring_mcp = _norm_dist(thumb_tip, ring_mcp)
+
+                            # Pre-Pinch Cursor Stabilization ("Pinch Anchor"):
+                            damping_scale = 1.0
+                            if self.pinch_stabilization and main_commands_ready:
+                                active_vals_now = set(self._gesture_active_action.values())
+                                is_dragging = (
+                                    "hold_lmb" in active_vals_now or "hold_mmb" in active_vals_now
                                 )
-                                damping_scale = 0.12 + 0.88 * ratio
-                                is_stabilized = damping_scale < 0.65
+                                min_click_dist = min(d_mid, d_ring)
+                                if now - self._last_click_anchor_time < 0.11 and not is_dragging:
+                                    damping_scale = 0.08
+                                    is_stabilized = True
+                                elif min_click_dist < eff_pinch * 1.60 and not is_dragging:
+                                    ratio = _clamp(
+                                        (min_click_dist - eff_pinch * 0.85) / (eff_pinch * 0.75),
+                                        0.0,
+                                        1.0,
+                                    )
+                                    damping_scale = 0.12 + 0.88 * ratio
+                                    is_stabilized = damping_scale < 0.65
 
-                        # 1. Index fingertip (landmark 8) -> smoothed cursor coordinates
-                        span_x = max(1e-5, 1.0 - self.margin_left - self.margin_right)
-                        span_y = max(1e-5, 1.0 - self.margin_top - self.margin_bottom)
-                        norm_x = _clamp((index_tip.x - self.margin_left) / span_x)
-                        norm_y = _clamp((index_tip.y - self.margin_top) / span_y)
+                            # 1. Index fingertip (landmark 8) -> smoothed cursor coordinates
+                            span_x = max(1e-5, 1.0 - self.margin_left - self.margin_right)
+                            span_y = max(1e-5, 1.0 - self.margin_top - self.margin_bottom)
+                            norm_x = _clamp((index_tip.x - self.margin_left) / span_x)
+                            norm_y = _clamp((index_tip.y - self.margin_top) / span_y)
 
-                        raw_x = norm_x * self.screen_width
-                        raw_y = norm_y * self.screen_height
-                        smooth_x, smooth_y = self.smoother.update(
-                            raw_x,
-                            raw_y,
-                            now,
-                            damping_scale=damping_scale,
-                        )
-                        self._last_smooth_x, self._last_smooth_y = smooth_x, smooth_y
+                            raw_x = norm_x * self.screen_width
+                            raw_y = norm_y * self.screen_height
+                            smooth_x, smooth_y = self.smoother.update(
+                                raw_x,
+                                raw_y,
+                                now,
+                                damping_scale=damping_scale,
+                            )
+                            self._last_smooth_x, self._last_smooth_y = smooth_x, smooth_y
 
-                        self.cursor_moved.emit(smooth_x, smooth_y)
+                            self.cursor_moved.emit(smooth_x, smooth_y)
 
-                        self._update_main_gesture(
-                            "thumb_middle",
-                            d_mid,
-                            eff_pinch,
-                            eff_release,
-                            smooth_x,
-                            smooth_y,
-                        )
-                        self._update_main_gesture(
-                            "thumb_ring",
-                            d_ring,
-                            eff_pinch,
-                            eff_release,
-                            smooth_x,
-                            smooth_y,
-                        )
-                        self._update_main_gesture(
-                            "thumb_pinky",
-                            d_pinky,
-                            eff_pinch,
-                            eff_release,
-                            smooth_x,
-                            smooth_y,
-                        )
+                            if main_commands_ready:
+                                self._update_main_gesture(
+                                    "thumb_middle",
+                                    d_mid,
+                                    eff_pinch,
+                                    eff_release,
+                                    smooth_x,
+                                    smooth_y,
+                                )
+                                self._update_main_gesture(
+                                    "thumb_ring",
+                                    d_ring,
+                                    eff_pinch,
+                                    eff_release,
+                                    smooth_x,
+                                    smooth_y,
+                                )
+                                self._update_main_gesture(
+                                    "thumb_pinky",
+                                    d_pinky,
+                                    eff_pinch,
+                                    eff_release,
+                                    smooth_x,
+                                    smooth_y,
+                                )
 
-                        fingertip_pinch_busy = (
-                            self._gesture_pinched["thumb_middle"]
-                            or self._gesture_pinched["thumb_ring"]
-                            or self._gesture_pinched["thumb_pinky"]
-                            or min(d_mid, d_ring, d_pinky) < 0.075 * hand_scale
-                        )
-                        self._update_main_gesture(
-                            "thumb_ring_mcp",
-                            d_ring_mcp,
-                            eff_mmb_pinch,
-                            eff_mmb_release,
-                            smooth_x,
-                            smooth_y,
-                            blocked=fingertip_pinch_busy,
-                        )
+                                fingertip_pinch_busy = (
+                                    self._gesture_pinched["thumb_middle"]
+                                    or self._gesture_pinched["thumb_ring"]
+                                    or self._gesture_pinched["thumb_pinky"]
+                                    or min(d_mid, d_ring, d_pinky) < 0.075 * hand_scale
+                                )
+                                self._update_main_gesture(
+                                    "thumb_ring_mcp",
+                                    d_ring_mcp,
+                                    eff_mmb_pinch,
+                                    eff_mmb_release,
+                                    smooth_x,
+                                    smooth_y,
+                                    blocked=fingertip_pinch_busy,
+                                )
+                            else:
+                                self._release_all_gestures()
+                        else:
+                            if self._hand_present:
+                                self._hand_present = False
+                                self.hand_presence_changed.emit(False)
+                            self._release_all_gestures()
 
-                        # Additional (2nd) Hand Gestures (Custom + Built-in)
+                        # Additional (2nd) Hand Gestures (Custom + Built-in + Safe Unlock & Time Margin)
                         sec_action_display = None
                         sec_pinch_pair = None
                         sec_hold_progress = 0.0
                         if secondary_lms is not None:
                             sec_scale = _compute_hand_scale_factor(secondary_lms)
-                            sec_gesture, sec_pinch_pair = _detect_secondary_gesture(
-                                secondary_lms,
-                                self.custom_gestures,
-                                hand_scale=sec_scale,
-                                sensitivity_mult=sens_mult,
-                            )
-                            if sec_gesture is not None:
-                                mapped_action = self.secondary_bindings.get(sec_gesture, "none")
-                                sec_action_display = (
-                                    _format_action_banner(mapped_action)
-                                    if mapped_action != "none"
-                                    else sec_gesture
-                                )
-                                self._sec_neutral_frames = 0
-                                if sec_gesture == self._sec_candidate_gesture:
-                                    self._sec_hold_frames += 1
-                                else:
-                                    self._sec_candidate_gesture = sec_gesture
-                                    self._sec_hold_frames = 1
-
-                                sec_hold_progress = min(
-                                    1.0, self._sec_hold_frames / float(SECONDARY_HOLD_FRAMES)
-                                )
-
-                                if (
-                                    self._sec_hold_frames == SECONDARY_HOLD_FRAMES
-                                    and self._sec_latched_gesture != sec_gesture
-                                ):
-                                    self._sec_latched_gesture = sec_gesture
-                                    if mapped_action != "none":
-                                        self._activate_action(mapped_action, smooth_x, smooth_y)
-                                        self._deactivate_action(mapped_action, smooth_x, smooth_y)
-                                        self._last_sec_banner = (
-                                            f"2ND HAND: {_format_action_banner(mapped_action)}"
+                            if self.safe_hand_detection and not self._main_hand_unlocked:
+                                # Wait for the first hand to activate as Main Hand before activating 2nd hand
+                                self._sec_unlock_frames = 0
+                                sec_action_display = "PEACE TO UNLOCK"
+                            elif self.safe_hand_detection and not self._sec_hand_unlocked:
+                                if _is_peace_sign(secondary_lms):
+                                    self._sec_unlock_frames += 1
+                                    sec_hold_progress = min(
+                                        1.0,
+                                        self._sec_unlock_frames / float(SAFE_UNLOCK_HOLD_FRAMES),
+                                    )
+                                    sec_action_display = "UNLOCKING..."
+                                    if self._sec_unlock_frames >= SAFE_UNLOCK_HOLD_FRAMES:
+                                        self._sec_hand_unlocked = True
+                                        self._sec_unlock_frames = 0
+                                        self._sec_activated_time = now
+                                        init_g, _ = _detect_secondary_gesture(
+                                            secondary_lms,
+                                            self.custom_gestures,
+                                            hand_scale=sec_scale,
+                                            sensitivity_mult=sens_mult,
                                         )
+                                        self._sec_latched_gesture = init_g or "two_fingers"
+                                        self._sec_candidate_gesture = None
+                                        self._sec_hold_frames = 0
+                                        self._last_sec_banner = "2ND HAND: ACTIVATED"
                                         self._last_sec_banner_time = now
+                                        self.hand_activated.emit("Alternative Hand")
+                                else:
+                                    self._sec_unlock_frames = 0
+                                    sec_action_display = "PEACE TO UNLOCK"
                             else:
-                                self._sec_candidate_gesture = None
-                                self._sec_hold_frames = 0
-                                self._sec_neutral_frames += 1
-                                if self._sec_neutral_frames >= 4:
-                                    self._sec_latched_gesture = None
+                                sec_warmup_remaining = (
+                                    max(0.0, self.activation_delay - (now - self._sec_activated_time))
+                                    if self.safe_hand_detection
+                                    else 0.0
+                                )
+                                if sec_warmup_remaining > 0.0:
+                                    self._sec_candidate_gesture = None
+                                    self._sec_hold_frames = 0
+                                    sec_action_display = f"READY IN {sec_warmup_remaining:.1f}s"
+                                    if self.activation_delay > 0:
+                                        sec_hold_progress = _clamp(
+                                            1.0 - (sec_warmup_remaining / self.activation_delay),
+                                            0.0,
+                                            1.0,
+                                        )
+                                else:
+                                    sec_gesture, sec_pinch_pair = _detect_secondary_gesture(
+                                        secondary_lms,
+                                        self.custom_gestures,
+                                        hand_scale=sec_scale,
+                                        sensitivity_mult=sens_mult,
+                                    )
+                                    if sec_gesture is not None:
+                                        mapped_action = self.secondary_bindings.get(sec_gesture, "none")
+                                        sec_action_display = (
+                                            _format_action_banner(mapped_action)
+                                            if mapped_action != "none"
+                                            else sec_gesture
+                                        )
+                                        self._sec_neutral_frames = 0
+                                        if sec_gesture == self._sec_candidate_gesture:
+                                            self._sec_hold_frames += 1
+                                        else:
+                                            self._sec_candidate_gesture = sec_gesture
+                                            self._sec_hold_frames = 1
+
+                                        sec_hold_progress = min(
+                                            1.0, self._sec_hold_frames / float(SECONDARY_HOLD_FRAMES)
+                                        )
+
+                                        if (
+                                            self._sec_hold_frames == SECONDARY_HOLD_FRAMES
+                                            and self._sec_latched_gesture != sec_gesture
+                                        ):
+                                            self._sec_latched_gesture = sec_gesture
+                                            if mapped_action != "none":
+                                                self._activate_action(mapped_action, smooth_x, smooth_y)
+                                                self._deactivate_action(
+                                                    mapped_action, smooth_x, smooth_y
+                                                )
+                                                self._last_sec_banner = (
+                                                    f"2ND HAND: {_format_action_banner(mapped_action)}"
+                                                )
+                                                self._last_sec_banner_time = now
+                                    else:
+                                        self._sec_candidate_gesture = None
+                                        self._sec_hold_frames = 0
+                                        self._sec_neutral_frames += 1
+                                        if self._sec_neutral_frames >= 4:
+                                            self._sec_latched_gesture = None
 
                         # Draw skeleton meshes and labels on preview frame only when preview is visible
                         if self.preview_enabled or self.show_cv_window:
@@ -977,15 +1159,26 @@ class HandTrackingWorker(QThread):
                                 hold_pinched="hold_lmb" in active_vals,
                                 mmb_pinched="hold_mmb" in active_vals,
                                 stabilized=is_stabilized,
+                                locked=not main_active,
+                                unlock_progress=main_unlock_progress,
                             )
                             mwx, mwy = int(hand_lms[WRIST].x * w), int(hand_lms[WRIST].y * h)
+                            if not main_active:
+                                main_lbl = "MAIN (PEACE TO UNLOCK)"
+                                main_col = (80, 200, 255)
+                            elif not main_commands_ready:
+                                main_lbl = f"MAIN (READY IN {main_warmup_remaining:.1f}s)"
+                                main_col = (80, 230, 255)
+                            else:
+                                main_lbl = "MAIN"
+                                main_col = (100, 255, 180)
                             cv2.putText(
                                 frame,
-                                "MAIN",
-                                (max(10, mwx - 25), min(h - 10, mwy + 25)),
+                                main_lbl,
+                                (max(10, mwx - 35), min(h - 10, mwy + 25)),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
-                                (100, 255, 180),
+                                main_col,
                                 2,
                             )
                             if secondary_lms is not None:
@@ -1007,9 +1200,14 @@ class HandTrackingWorker(QThread):
                             self._hand_present = False
                             self.hand_presence_changed.emit(False)
 
-                        if any(self._gesture_pinched.values()):
-                            lost_hand_frames += 1
-                            if lost_hand_frames > 10:
+                        lost_hand_frames += 1
+                        self._sec_lost_frames += 1
+                        if lost_hand_frames > 10:
+                            self._main_hand_unlocked = False
+                            self._main_unlock_frames = 0
+                            self._sec_hand_unlocked = False
+                            self._sec_unlock_frames = 0
+                            if any(self._gesture_pinched.values()):
                                 self._release_all_gestures()
 
                     if self.preview_enabled or self.show_cv_window:

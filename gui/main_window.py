@@ -77,6 +77,7 @@ MAIN_ACTION_OPTIONS: List[Tuple[str, str]] = [
     ("task_view", "Task View (Win+Tab)"),
     ("screenshot", "Screenshot (Win+Shift+S)"),
     ("open_osk", "Open Virtual Keyboard"),
+    ("toggle_cam_overlay", "Open / Hide Floating Webcam"),
     ("media_play_pause", "Media Play / Pause"),
     ("media_next", "Media Next Track"),
     ("media_prev", "Media Previous Track"),
@@ -96,6 +97,7 @@ SECONDARY_ACTION_OPTIONS: List[Tuple[str, str]] = [
     ("task_view", "Task View (Win+Tab)"),
     ("screenshot", "Screenshot (Win+Shift+S)"),
     ("open_osk", "Open Virtual Keyboard"),
+    ("toggle_cam_overlay", "Open / Hide Floating Webcam"),
     ("left_click", "Left Click (LMB)"),
     ("double_click", "Double Click (2x LMB)"),
     ("right_click", "Right Click (RMB)"),
@@ -316,12 +318,16 @@ class MainWindow(QMainWindow):
         tracker: HandTrackingWorker,
         on_close_callback: Optional[Callable[[], None]] = None,
         on_toggle_keyboard: Optional[Callable[[], None]] = None,
+        on_toggle_webcam_overlay: Optional[Callable[[], None]] = None,
+        on_visibility_changed: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.tracker = tracker
         self._on_close_callback = on_close_callback
         self._on_toggle_keyboard = on_toggle_keyboard
+        self._on_toggle_webcam_overlay = on_toggle_webcam_overlay
+        self._on_visibility_changed = on_visibility_changed
         self._allow_close = False
 
         self.setWindowTitle("Cam-Glove — Hand Tracking Control Center")
@@ -356,6 +362,15 @@ class MainWindow(QMainWindow):
         self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pause_btn.clicked.connect(self.tracker.toggle_paused)
         status_row.addWidget(self.pause_btn)
+
+        if self._on_toggle_webcam_overlay is not None:
+            self.float_cam_top_btn = QPushButton("📷 Floating Webcam", self)
+            self.float_cam_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.float_cam_top_btn.setToolTip(
+                "Open/hide always-on-top webcam mesh window (read-only orange bound)"
+            )
+            self.float_cam_top_btn.clicked.connect(self._on_toggle_webcam_overlay)
+            status_row.addWidget(self.float_cam_top_btn)
 
         status_row.addStretch(1)
 
@@ -412,6 +427,41 @@ class MainWindow(QMainWindow):
             self.vk_btn = QPushButton("⌨ Open / Hide Virtual Keyboard", self)
             self.vk_btn.clicked.connect(self._on_toggle_keyboard)
             hand_form.addRow("", self.vk_btn)
+
+        if self._on_toggle_webcam_overlay is not None:
+            self.cam_overlay_btn = QPushButton("📷 Open / Hide Floating Webcam", self)
+            self.cam_overlay_btn.clicked.connect(self._on_toggle_webcam_overlay)
+            hand_form.addRow("", self.cam_overlay_btn)
+
+        self.safe_hand_checkbox = QCheckBox(
+            "Safe Hand Detection (Peace Sign ✌ to start control)", hand_group
+        )
+        self.safe_hand_checkbox.setToolTip(
+            "Always detect hands, but require showing a Peace Sign (Index + Middle fingers) "
+            "before the Main Hand or 2nd Hand starts controlling the PC."
+        )
+        self.safe_hand_checkbox.toggled.connect(self._on_feel_changed)
+        hand_form.addRow("", self.safe_hand_checkbox)
+
+        delay_row = QWidget(hand_group)
+        delay_h = QHBoxLayout(delay_row)
+        delay_h.setContentsMargins(0, 0, 0, 0)
+        delay_h.setSpacing(8)
+        self.activation_delay_slider = QSlider(Qt.Orientation.Horizontal, delay_row)
+        self.activation_delay_slider.setRange(0, 50)  # 0.0s .. 5.0s in 0.1s steps
+        self.activation_delay_slider.setValue(20)
+        self.activation_delay_slider.setToolTip(
+            "Grace period after Peace Sign activation before gesture commands start executing"
+        )
+        self.activation_delay_lbl = QLabel("2.0s", delay_row)
+        self.activation_delay_lbl.setFixedWidth(38)
+        self.activation_delay_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.activation_delay_slider.valueChanged.connect(self._on_feel_changed)
+        delay_h.addWidget(self.activation_delay_slider, stretch=1)
+        delay_h.addWidget(self.activation_delay_lbl)
+        hand_form.addRow("Activation Margin:", delay_row)
 
         controls_layout.addWidget(hand_group)
 
@@ -769,6 +819,16 @@ class MainWindow(QMainWindow):
         self.stabilize_checkbox.setChecked(self.tracker.pinch_stabilization)
         self.stabilize_checkbox.blockSignals(False)
 
+        self.safe_hand_checkbox.blockSignals(True)
+        self.safe_hand_checkbox.setChecked(self.tracker.safe_hand_detection)
+        self.safe_hand_checkbox.blockSignals(False)
+
+        delay_tenths = int(round(self.tracker.activation_delay * 10))
+        self.activation_delay_slider.blockSignals(True)
+        self.activation_delay_slider.setValue(delay_tenths)
+        self.activation_delay_slider.blockSignals(False)
+        self.activation_delay_lbl.setText(f"{self.tracker.activation_delay:.1f}s")
+
         for g_key, combo in self.main_combos.items():
             act = self.tracker.main_bindings.get(g_key, DEFAULT_MAIN_BINDINGS[g_key])
             combo.blockSignals(True)
@@ -808,12 +868,17 @@ class MainWindow(QMainWindow):
         smooth_val = self.smoothing_slider.value()
         sens_val = self.sensitivity_slider.value()
         stab = self.stabilize_checkbox.isChecked()
+        safe_hand = self.safe_hand_checkbox.isChecked()
+        delay_sec = self.activation_delay_slider.value() / 10.0
 
         self.smoothing_val_lbl.setText(f"{smooth_val}%")
         self.sensitivity_val_lbl.setText(f"{sens_val}%")
+        self.activation_delay_lbl.setText(f"{delay_sec:.1f}s")
         self.tracker.set_smoothing_level(smooth_val)
         self.tracker.set_pinch_sensitivity(sens_val)
         self.tracker.pinch_stabilization = stab
+        self.tracker.set_safe_hand_detection(safe_hand)
+        self.tracker.set_activation_delay(delay_sec)
         self._save_settings()
 
     def _sync_roi_sliders_from_tracker(self) -> None:
@@ -882,6 +947,8 @@ class MainWindow(QMainWindow):
         self.tracker.reset_default_bindings()
         self.tracker.set_preferred_main_hand("Right")
         self.tracker.pinch_stabilization = True
+        self.tracker.set_safe_hand_detection(False)
+        self.tracker.set_activation_delay(2.0)
         self._sync_ui_from_tracker()
         self._save_settings()
 
@@ -902,6 +969,10 @@ class MainWindow(QMainWindow):
                 self.tracker.set_pinch_sensitivity(int(data["pinch_sensitivity"]))
             if isinstance(data.get("pinch_stabilization"), bool):
                 self.tracker.pinch_stabilization = bool(data["pinch_stabilization"])
+            if isinstance(data.get("safe_hand_detection"), bool):
+                self.tracker.set_safe_hand_detection(bool(data["safe_hand_detection"]))
+            if isinstance(data.get("activation_delay"), (int, float)):
+                self.tracker.set_activation_delay(float(data["activation_delay"]))
             if isinstance(data.get("custom_gestures"), list):
                 self.tracker.custom_gestures = [
                     g for g in data["custom_gestures"] if isinstance(g, dict) and "id" in g
@@ -932,6 +1003,8 @@ class MainWindow(QMainWindow):
             "smoothing_level": self.tracker.smoothing_level,
             "pinch_sensitivity": self.tracker.pinch_sensitivity,
             "pinch_stabilization": self.tracker.pinch_stabilization,
+            "safe_hand_detection": self.tracker.safe_hand_detection,
+            "activation_delay": round(self.tracker.activation_delay, 2),
             "main_bindings": self.tracker.main_bindings,
             "secondary_bindings": self.tracker.secondary_bindings,
             "custom_gestures": self.tracker.custom_gestures,
@@ -961,10 +1034,15 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802
         self.tracker.set_preview_enabled(True)
+        if self._on_visibility_changed is not None:
+            self._on_visibility_changed()
         super().showEvent(event)
 
     def hideEvent(self, event: QHideEvent) -> None:  # noqa: N802
-        self.tracker.set_preview_enabled(False)
+        if self._on_visibility_changed is not None:
+            self._on_visibility_changed()
+        else:
+            self.tracker.set_preview_enabled(False)
         super().hideEvent(event)
 
     def restore_from_tray(self) -> None:

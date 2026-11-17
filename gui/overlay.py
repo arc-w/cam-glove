@@ -104,8 +104,8 @@ class CursorOverlay(QWidget):
 
     def _on_frame_tick(self) -> None:
         self._tick_count += 1
-        # Periodically re-assert HWND_TOPMOST (~10 times/sec) so newly opened popup menus stay behind cursor
-        if self._tick_count % 6 == 0:
+        # Re-assert HWND_TOPMOST frequently so the cursor ring stays above the virtual keyboard and popup menus
+        if self._tick_count % 2 == 0:
             self._apply_win32_topmost()
         self.update()
 

@@ -53,6 +53,7 @@ class InputController(QObject):
     """Dispatches LMB/MMB click-and-hold, clicks, wheel scrolls, media keys, and shortcuts."""
 
     toggle_virtual_keyboard_requested = Signal()
+    toggle_webcam_overlay_requested = Signal()
 
     def __init__(
         self,
@@ -204,6 +205,9 @@ class InputController(QObject):
         act = action.lower()
         if act == "open_osk":
             self._open_virtual_keyboard()
+            return
+        if act == "toggle_cam_overlay":
+            self.toggle_webcam_overlay_requested.emit()
             return
         if act == "scroll_up":
             self._send_wheel(4)
